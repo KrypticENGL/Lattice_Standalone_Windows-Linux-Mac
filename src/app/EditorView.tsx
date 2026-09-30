@@ -7,6 +7,8 @@ import type { RuntimeSession } from "../runtime";
 import { Panel } from "../ui/Panel";
 import { Splitter } from "../ui/Splitter";
 import { appConfig } from "../config/appConfig";
+import type { ClangdSnapshot } from "../lsp/controller";
+import { LanguageBanner } from "../ui/LanguageBanner";
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
@@ -15,10 +17,12 @@ interface Props {
   onEditorReady: (getValue: () => string) => void;
   session: RuntimeSession | null;
   runError: string | null;
+  language: ClangdSnapshot;
+  onConfigureClangd: () => void;
 }
 
 /** Editor + visualization + output split. */
-export function EditorView({ onCursorChange, onEditorReady, session, runError }: Props) {
+export function EditorView({ onCursorChange, onEditorReady, session, runError, language, onConfigureClangd }: Props) {
   const [editorWidth, setEditorWidth] = useState(45); // % of workspace width
   const [outputHeight, setOutputHeight] = useState(220); // px
 
@@ -33,7 +37,12 @@ export function EditorView({ onCursorChange, onEditorReady, session, runError }:
     <div className="workspace" style={{ gridTemplateRows: `minmax(0,1fr) 5px ${outputHeight}px` }}>
       <div className="top-row" style={{ gridTemplateColumns: `${editorWidth}% 5px minmax(0,1fr)` }}>
         <Panel title={appConfig.defaultFileName} className="editor-panel">
-          <CodeEditor onCursorChange={onCursorChange} onReady={onEditorReady} />
+          <div className="editor-stack">
+            <LanguageBanner language={language} onConfigure={onConfigureClangd} />
+            <div className="editor-fill">
+              <CodeEditor onCursorChange={onCursorChange} onReady={onEditorReady} />
+            </div>
+          </div>
         </Panel>
         <Splitter orientation="vertical" onDrag={dragColumns} />
         <Panel title="Visualization" className="viz-panel">

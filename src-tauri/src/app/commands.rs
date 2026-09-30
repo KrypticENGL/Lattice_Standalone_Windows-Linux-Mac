@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::config;
+use crate::lsp::{self, discovery::ClangdStatus, LspManager, LspSession};
 use crate::runtime::{ExecutionManager, RunRequest, RuntimeSession, SourceFile};
 use crate::toolchain::ToolchainStatus;
 
@@ -12,6 +13,7 @@ pub const SESSION_EVENT: &str = "lattice://session-state";
 
 pub struct AppState {
     pub execution: Arc<ExecutionManager>,
+    pub lsp: Arc<LspManager>,
 }
 
 #[derive(Serialize)]
@@ -84,4 +86,52 @@ pub async fn rescan_toolchain(state: State<'_, AppState>) -> Result<ToolchainSta
     tauri::async_runtime::spawn_blocking(move || manager.rescan_toolchain())
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn clangd_status(state: State<'_, AppState>) -> Result<ClangdStatus, String> {
+    let lsp = state.lsp.clone();
+    tauri::async_runtime::spawn_blocking(move || lsp.status()).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn clangd_rescan(state: State<'_, AppState>) -> Result<ClangdStatus, String> {
+    let lsp = state.lsp.clone();
+    tauri::async_runtime::spawn_blocking(move || lsp.rescan()).await.map_err(|e| e.to_string())
+}
+
+/// Save the clangd path (`None` or blank restores auto-discovery). Rejects paths that are not clangd.
+#[tauri::command]
+pub async fn clangd_set_path(state: State<'_, AppState>, path: Option<String>) -> Result<ClangdStatus, String> {
+    let lsp = state.lsp.clone();
+    tauri::async_runtime::spawn_blocking(move || lsp.set_path(path)).await.map_err(|e| e.to_string())?
+}
+
+/// Start (or restart) clangd. LSP traffic then flows through `clangd_send` and
+/// the `lattice://lsp-message` event.
+#[tauri::command]
+pub async fn clangd_start(app: AppHandle, state: State<'_, AppState>, file_name: String) -> Result<LspSession, String> {
+    let lsp = state.lsp.clone();
+    let execution = state.execution.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let compiler = execution.compiler_info();
+        lsp.start(app, &file_name, compiler.as_ref(), &execution.config().cxx_standard)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn clangd_send(state: State<'_, AppState>, message: String) -> Result<(), String> {
+    state.lsp.send(&message)
+}
+
+#[tauri::command]
+pub fn clangd_stop(state: State<'_, AppState>) {
+    state.lsp.stop();
+}
+
+#[tauri::command]
+pub fn read_source_file(uri: String) -> Result<String, String> {
+    lsp::read_source_file(&uri)
 }

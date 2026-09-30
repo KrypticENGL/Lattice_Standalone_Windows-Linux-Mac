@@ -1,5 +1,7 @@
 import Editor from "@monaco-editor/react";
 import type { editor } from "monaco-editor";
+import { appConfig } from "../config/appConfig";
+import { clangd } from "../lsp/controller";
 import { LATTICE_THEME } from "./monacoSetup";
 import { placeholderCode } from "./placeholderCode";
 
@@ -24,6 +26,8 @@ const options: editor.IStandaloneEditorConstructionOptions = {
   renderLineHighlight: "line",
   padding: { top: 12 },
   smoothScrolling: false,
+  fixedOverflowWidgets: true,
+  parameterHints: { enabled: true },
 };
 
 export function CodeEditor({ onCursorChange, onReady }: Props) {
@@ -42,6 +46,8 @@ export function CodeEditor({ onCursorChange, onReady }: Props) {
         ed.onDidChangeCursorPosition(report);
         report();
         onReady?.(() => ed.getValue());
+        // clangd supplies completion, diagnostics, hover and navigation; detaches when the editor is disposed.
+        clangd.attach(ed, appConfig.defaultFileName);
       }}
     />
   );

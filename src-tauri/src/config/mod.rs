@@ -3,7 +3,22 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub mod settings;
+
 pub const APP_NAME: &str = "Lattice";
+
+/// `%LOCALAPPDATA%\Lattice` (falls back to the OS temp dir).
+pub fn app_data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(APP_NAME)
+}
+
+/// Scratch directory holding the editor's document and `compile_commands.json` for clangd.
+pub fn editor_workspace_dir() -> PathBuf {
+    app_data_dir().join("Editor")
+}
 
 /// When a session's temporary workspace is deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,11 +50,7 @@ pub struct ExecutionConfig {
 impl ExecutionConfig {
     /// `%LOCALAPPDATA%\Lattice\Runtime` (falls back to the OS temp dir).
     pub fn default_runtime_root() -> PathBuf {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join(APP_NAME)
-            .join("Runtime")
+        app_data_dir().join("Runtime")
     }
 }
 

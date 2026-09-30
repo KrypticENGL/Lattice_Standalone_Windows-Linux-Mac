@@ -63,6 +63,11 @@ impl ExecutionManager {
         self.toolchain.lock().unwrap().status()
     }
 
+    /// The compiler builds will use, so editor tooling can mirror it.
+    pub fn compiler_info(&self) -> Option<crate::toolchain::CompilerInfo> {
+        self.toolchain.lock().unwrap().preferred().map(|c| c.info().clone())
+    }
+
     /// Re-run compiler discovery (e.g. after the user installs one).
     pub fn rescan_toolchain(&self) -> ToolchainStatus {
         let fresh = Arc::new(Toolchain::discover(&DiscoverySpec::from_environment()));

@@ -10,6 +10,8 @@ import { getAppInfo, type AppInfo } from "../utils/native";
 import { useExecution } from "../runtime/useExecution";
 import { statusText } from "../runtime/status";
 import { appConfig } from "../config/appConfig";
+import { useClangd } from "../lsp/useClangd";
+import { ClangdDialog } from "../ui/ClangdDialog";
 import { EditorView } from "./EditorView";
 import { views, type ViewId } from "./views";
 
@@ -17,6 +19,8 @@ export function App() {
   const [view, setView] = useState<ViewId>("editor");
   const [cursor, setCursor] = useState<CursorPosition>({ line: 1, column: 1 });
   const [info, setInfo] = useState<AppInfo | null>(null);
+  const [clangdDialog, setClangdDialog] = useState(false);
+  const language = useClangd();
 
   const getValueRef = useRef<() => string>(() => "");
   const getSource = useCallback(() => getValueRef.current(), []);
@@ -65,7 +69,7 @@ export function App() {
         <main className="content">
           {/* Kept mounted (hidden) so editor state survives view switches. */}
           <div className="view" hidden={view !== "editor"}>
-            <EditorView onCursorChange={setCursor} onEditorReady={onEditorReady} session={exec.session} runError={exec.localError} />
+            <EditorView onCursorChange={setCursor} onEditorReady={onEditorReady} session={exec.session} runError={exec.localError} language={language} onConfigureClangd={() => setClangdDialog(true)} />
           </div>
           {view === "visualizer" && (
             <div className="view workspace-single">
@@ -79,7 +83,8 @@ export function App() {
           )}
         </main>
       </div>
-      <StatusBar line={cursor.line} column={cursor.column} info={info} status={statusText(exec.session, exec.running)} />
+      <StatusBar line={cursor.line} column={cursor.column} info={info} status={statusText(exec.session, exec.running)} language={language} onLanguageClick={() => setClangdDialog(true)} />
+      {clangdDialog && <ClangdDialog onClose={() => setClangdDialog(false)} />}
     </div>
   );
 }

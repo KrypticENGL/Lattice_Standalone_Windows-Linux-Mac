@@ -37,6 +37,40 @@ placeholders. **Runtime data-structure visualization is NOT implemented yet.**
 What exists is a real compile-and-run pipeline (below) with a marked seam where
 observation will attach.
 
+## Editor language services (clangd)
+
+The editor stays Monaco. C++ intelligence comes from `clangd` over LSP; Lattice
+implements no parser or analysis of its own.
+
+```
+Monaco  <->  src/lsp (client + providers)  <->  Tauri IPC  <->  src-tauri/src/lsp  <->  clangd (stdio)
+```
+
+- **Backend (`src-tauri/src/lsp`)** is a dumb pipe: discover clangd, spawn it,
+  frame/deframe `Content-Length` messages, report unexpected exit. Commands:
+  `clangd_status`, `clangd_rescan`, `clangd_set_path`, `clangd_start`,
+  `clangd_send`, `clangd_stop`, `read_source_file`. Events:
+  `lattice://lsp-message`, `lattice://lsp-exit`.
+- **Frontend (`src/lsp`)**: `client.ts` (JSON-RPC), `providers.ts` (Monaco
+  providers: completion, hover, signature help, definition/declaration/type/
+  implementation, references, highlights, outline, rename, quick fixes,
+  formatting), `convert.ts` (pure conversions), `controller.ts` (lifecycle,
+  document sync, diagnostics -> markers, observable status for the UI).
+- **Discovery order**: path saved in `%LOCALAPPDATA%\Lattice\settings.json`
+  (UI: status bar -> clangd), `LATTICE_CLANGD`, `PATH`, then LLVM / Scoop /
+  MSYS2 / JetBrains-bundled locations. A configured path that is not a working
+  clangd is reported, never silently replaced. Failures always show a banner and
+  a status-bar state; nothing fails silently.
+- **Project flags**: clangd's project is `%LOCALAPPDATA%\Lattice\Editor` with a
+  generated `compile_commands.json` that uses the *same compiler and `-std`* as
+  the execution engine, plus `--query-driver=<compiler>` so `std::` resolves
+  against the same standard library the program is built with. A `.clang-format`
+  there gives 4-space formatting. If clangd ships without its builtin headers
+  (some IDE-bundled copies), the compiler's are supplied instead.
+- **Limitations**: single document (`main.cpp`). Go-to-definition into headers
+  opens a read-only peek (Monaco standalone cannot switch files). Semantic
+  highlighting, inlay hints and call/type hierarchy are not wired up yet.
+
 ## Execution engine (current)
 
 Lattice compiles and runs the user's real C++ with a real compiler. There is no
