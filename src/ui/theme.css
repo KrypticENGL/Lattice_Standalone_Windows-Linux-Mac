@@ -1,0 +1,25 @@
+:root {
+  --bg: #0b1118;
+  --bg-elevated: #0f1720;
+  --border: #1c2733;
+  --text: #d7dee6;
+  --muted: #7d8a99;
+  --accent: #c9e265;
+  --accent-fg: #11170a;
+  --font-ui: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Code", Consolas, "Courier New", monospace;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 var(--font-ui);
+  overflow: hidden;
+  user-select: none;
+}
+button { font: inherit; color: inherit; }
+:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.muted { color: var(--muted); }
