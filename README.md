@@ -10,6 +10,10 @@ rendered in 2D from the program's **runtime** behavior.
 toolbar, a Monaco C++ editor (with sample text), an empty visualization area and
 Output / Errors / Runtime tabs.
 
+The sidebar switches between Editor, Visualizer, Project, Plugins, Canvas, Posts and
+Saved Posts (Ctrl+1–7). Editor and Visualizer show the placeholder layout; the
+other five are empty "not implemented" pages.
+
 **Not implemented yet:** running or compiling C++, runtime observation or
 instrumentation, any data-structure visualization, file/project handling,
 settings. The Run, project and settings controls are disabled placeholders.
@@ -29,8 +33,8 @@ See [docs/architecture.md](docs/architecture.md) for why, and the trade-offs.
 
 ```
 src/                     Frontend (TypeScript)
-  app/                   Root component and layout composition
-  ui/                    Generic UI: toolbar, panels, splitter, status bar, theme CSS
+  app/                   Root component, view registry (views.ts), editor view
+  ui/                    Generic UI: toolbar, sidebar, panels, splitter, status bar, theme CSS
   editor/                Monaco integration
   visualization/         Future 2D rendering surface (placeholder)
   runtime/               Future frontend boundary for execution/observation

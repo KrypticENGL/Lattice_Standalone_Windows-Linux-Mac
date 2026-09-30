@@ -1,50 +1,62 @@
-import { useCallback, useEffect, useState } from "react";
-import { CodeEditor, type CursorPosition } from "../editor/CodeEditor";
-import "../editor/monacoSetup";
+import { useEffect, useState } from "react";
+import type { CursorPosition } from "../editor/CodeEditor";
 import { VisualizationCanvas } from "../visualization/VisualizationCanvas";
-import { OutputPanel } from "../ui/OutputPanel";
 import { Panel } from "../ui/Panel";
-import { Splitter } from "../ui/Splitter";
+import { Sidebar } from "../ui/Sidebar";
 import { StatusBar } from "../ui/StatusBar";
 import { Toolbar } from "../ui/Toolbar";
-import { appConfig } from "../config/appConfig";
+import { ViewPlaceholder } from "../ui/ViewPlaceholder";
 import { getAppInfo, type AppInfo } from "../utils/native";
-
-const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+import { EditorView } from "./EditorView";
+import { views, type ViewId } from "./views";
 
 export function App() {
+  const [view, setView] = useState<ViewId>("editor");
   const [cursor, setCursor] = useState<CursorPosition>({ line: 1, column: 1 });
   const [info, setInfo] = useState<AppInfo | null>(null);
-  const [editorWidth, setEditorWidth] = useState(45); // % of workspace width
-  const [outputHeight, setOutputHeight] = useState(220); // px
 
   useEffect(() => {
     void getAppInfo().then(setInfo);
   }, []);
 
-  const dragColumns = useCallback((dx: number) => {
-    setEditorWidth((w) => clamp(w + (dx / window.innerWidth) * 100, 20, 75));
+  // Ctrl+1..N switches views.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.altKey || e.shiftKey) return;
+      const target = views[Number(e.key) - 1];
+      if (target) {
+        e.preventDefault();
+        setView(target.id);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
-  const dragRows = useCallback((dy: number) => {
-    setOutputHeight((h) => clamp(h - dy, 80, window.innerHeight * 0.6));
-  }, []);
+
+  const other = views.find((v) => v.id === view && v.description);
 
   return (
     <div className="app">
       <Toolbar />
-      <main className="workspace" style={{ gridTemplateRows: `minmax(0,1fr) 5px ${outputHeight}px` }}>
-        <div className="top-row" style={{ gridTemplateColumns: `${editorWidth}% 5px minmax(0,1fr)` }}>
-          <Panel title={appConfig.defaultFileName} className="editor-panel">
-            <CodeEditor onCursorChange={setCursor} />
-          </Panel>
-          <Splitter orientation="vertical" onDrag={dragColumns} />
-          <Panel title="Visualization" className="viz-panel">
-            <VisualizationCanvas />
-          </Panel>
-        </div>
-        <Splitter orientation="horizontal" onDrag={dragRows} />
-        <OutputPanel />
-      </main>
+      <div className="body">
+        <Sidebar active={view} onSelect={setView} />
+        <main className="content">
+          {/* Kept mounted (hidden) so editor state survives view switches. */}
+          <div className="view" hidden={view !== "editor"}>
+            <EditorView onCursorChange={setCursor} />
+          </div>
+          {view === "visualizer" && (
+            <div className="view workspace-single">
+              <Panel title="Visualization"><VisualizationCanvas /></Panel>
+            </div>
+          )}
+          {other && (
+            <div className="view">
+              <ViewPlaceholder title={other.label} description={other.description!} />
+            </div>
+          )}
+        </main>
+      </div>
       <StatusBar line={cursor.line} column={cursor.column} info={info} />
     </div>
   );

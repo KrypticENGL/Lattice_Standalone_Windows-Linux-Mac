@@ -14,8 +14,26 @@
 .btn-run { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
 button:disabled { cursor: default; opacity: .55; }
 
+/* Sidebar + content */
+.body { display: grid; grid-template-columns: 72px minmax(0, 1fr); min-height: 0; }
+.sidebar { display: flex; flex-direction: column; gap: 2px; padding: 8px 6px; border-right: 1px solid var(--border); overflow-y: auto; }
+.nav-item { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 8px 2px;
+  background: none; border: 0; border-left: 2px solid transparent; border-radius: 4px;
+  color: var(--muted); font-size: 11px; cursor: pointer; }
+.nav-item:hover { color: var(--text); background: var(--bg-elevated); }
+.nav-item.active { color: var(--accent); background: var(--bg-elevated); border-left-color: var(--accent); }
+.content { min-width: 0; min-height: 0; }
+.view { height: 100%; }
+.view[hidden] { display: none; }
+.workspace-single { padding: 6px; display: flex; }
+.workspace-single .panel { flex: 1; }
+.view-placeholder { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; text-align: center; padding: 24px; }
+.view-placeholder h2 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+.view-placeholder p { margin: 0; max-width: 420px; color: var(--text); }
+.view-placeholder p.muted { color: var(--muted); margin-top: 8px; }
+
 /* Workspace */
-.workspace { display: grid; padding: 6px; min-height: 0; }
+.workspace { display: grid; padding: 6px; min-height: 0; height: 100%; }
 .top-row { display: grid; min-height: 0; }
 .panel { display: flex; flex-direction: column; min-width: 0; min-height: 0;
   background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
