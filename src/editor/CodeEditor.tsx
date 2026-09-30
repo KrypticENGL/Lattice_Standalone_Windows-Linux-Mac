@@ -10,6 +10,8 @@ export interface CursorPosition {
 
 interface Props {
   onCursorChange: (pos: CursorPosition) => void;
+  /** Hands the parent a function returning the editor's current text. */
+  onReady?: (getValue: () => string) => void;
 }
 
 const options: editor.IStandaloneEditorConstructionOptions = {
@@ -24,7 +26,7 @@ const options: editor.IStandaloneEditorConstructionOptions = {
   smoothScrolling: false,
 };
 
-export function CodeEditor({ onCursorChange }: Props) {
+export function CodeEditor({ onCursorChange, onReady }: Props) {
   return (
     <Editor
       language="cpp"
@@ -39,6 +41,7 @@ export function CodeEditor({ onCursorChange }: Props) {
         };
         ed.onDidChangeCursorPosition(report);
         report();
+        onReady?.(() => ed.getValue());
       }}
     />
   );

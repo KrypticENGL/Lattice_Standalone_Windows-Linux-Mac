@@ -3,6 +3,7 @@ import { CodeEditor, type CursorPosition } from "../editor/CodeEditor";
 import "../editor/monacoSetup";
 import { VisualizationCanvas } from "../visualization/VisualizationCanvas";
 import { OutputPanel } from "../ui/OutputPanel";
+import type { RuntimeSession } from "../runtime";
 import { Panel } from "../ui/Panel";
 import { Splitter } from "../ui/Splitter";
 import { appConfig } from "../config/appConfig";
@@ -11,10 +12,13 @@ const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v
 
 interface Props {
   onCursorChange: (pos: CursorPosition) => void;
+  onEditorReady: (getValue: () => string) => void;
+  session: RuntimeSession | null;
+  runError: string | null;
 }
 
 /** Editor + visualization + output split. */
-export function EditorView({ onCursorChange }: Props) {
+export function EditorView({ onCursorChange, onEditorReady, session, runError }: Props) {
   const [editorWidth, setEditorWidth] = useState(45); // % of workspace width
   const [outputHeight, setOutputHeight] = useState(220); // px
 
@@ -29,7 +33,7 @@ export function EditorView({ onCursorChange }: Props) {
     <div className="workspace" style={{ gridTemplateRows: `minmax(0,1fr) 5px ${outputHeight}px` }}>
       <div className="top-row" style={{ gridTemplateColumns: `${editorWidth}% 5px minmax(0,1fr)` }}>
         <Panel title={appConfig.defaultFileName} className="editor-panel">
-          <CodeEditor onCursorChange={onCursorChange} />
+          <CodeEditor onCursorChange={onCursorChange} onReady={onEditorReady} />
         </Panel>
         <Splitter orientation="vertical" onDrag={dragColumns} />
         <Panel title="Visualization" className="viz-panel">
@@ -37,7 +41,7 @@ export function EditorView({ onCursorChange }: Props) {
         </Panel>
       </div>
       <Splitter orientation="horizontal" onDrag={dragRows} />
-      <OutputPanel />
+      <OutputPanel session={session} runError={runError} />
     </div>
   );
 }

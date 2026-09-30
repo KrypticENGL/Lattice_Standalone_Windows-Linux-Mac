@@ -1,4 +1,14 @@
-//! Runtime execution and observation of user programs.
+//! Runtime sessions: compiling and running the user's program.
 //!
-//! Intentionally empty. The mechanism (process model, instrumentation,
-//! debugger integration, etc.) has not been decided.
+//! Dependency direction: `runtime` uses `toolchain` (compile) and `process`
+//! (execute). Neither depends on `runtime`, and nothing here knows about the UI.
+//! See `docs/architecture.md`.
+
+pub mod instrumentation;
+pub mod manager;
+pub mod session;
+pub mod workspace;
+
+pub use manager::{ExecutionManager, RunRequest};
+pub use session::{RuntimeSession, SessionId, SessionState, TerminationReason};
+pub use workspace::SourceFile;

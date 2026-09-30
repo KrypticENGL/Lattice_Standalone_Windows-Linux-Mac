@@ -63,3 +63,16 @@ button:disabled { cursor: default; opacity: .55; }
 /* Status bar */
 .statusbar { display: flex; align-items: center; gap: 16px; padding: 0 12px; border-top: 1px solid var(--border);
   color: var(--muted); font-size: 12px; }
+
+/* Execution output */
+.output-body { overflow: auto; white-space: pre-wrap; word-break: break-word; }
+.output-body .out-note { color: var(--muted); margin: 0 0 6px; }
+.output-body .out-stderr { color: #e0a458; }
+.output-body .diag { margin-bottom: 10px; }
+.output-body .diag-error { color: #f07178; }
+.output-body .diag-warning { color: #e0a458; }
+.output-body .diag-note { color: var(--muted); }
+.output-body .diag-context { color: var(--muted); margin: 2px 0 0; }
+.output-body .runtime-table { border-collapse: collapse; }
+.output-body .runtime-table td { padding: 1px 16px 1px 0; vertical-align: top; }
+.output-body .runtime-table td:first-child { color: var(--muted); }

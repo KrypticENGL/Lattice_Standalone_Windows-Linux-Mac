@@ -4,12 +4,13 @@ interface Props {
   line: number;
   column: number;
   info: AppInfo | null;
+  status: string;
 }
 
-export function StatusBar({ line, column, info }: Props) {
+export function StatusBar({ line, column, info, status }: Props) {
   return (
     <div className="statusbar">
-      <span>Ready</span>
+      <span>{status}</span>
       <span className="toolbar-spacer" />
       <span>Ln {line}, Col {column}</span>
       <span>Spaces: 4</span>

@@ -1,8 +1,14 @@
 import { appConfig } from "../config/appConfig";
 import { ChevronDownIcon, FolderIcon, PlayIcon, SettingsIcon } from "./icons";
 
-/** Header. Every control here is a placeholder except the app name. */
-export function Toolbar() {
+interface Props {
+  running: boolean;
+  onRun: () => void;
+  onStop: () => void;
+}
+
+/** Header. Run/Stop are live; the project picker and settings are still placeholders. */
+export function Toolbar({ running, onRun, onStop }: Props) {
   return (
     <header className="toolbar">
       <div className="brand">
@@ -18,10 +24,16 @@ export function Toolbar() {
 
       <div className="toolbar-spacer" />
 
-      <button className="btn btn-run" disabled title="Execution is not implemented yet">
-        <PlayIcon />
-        Run
-      </button>
+      {running ? (
+        <button className="btn btn-run" onClick={onStop} title="Stop the running program">
+          Stop
+        </button>
+      ) : (
+        <button className="btn btn-run" onClick={onRun} title="Compile and run (Ctrl+Enter)">
+          <PlayIcon />
+          Run
+        </button>
+      )}
       <button className="btn btn-icon" disabled title="Settings are not implemented yet" aria-label="Settings">
         <SettingsIcon />
       </button>
