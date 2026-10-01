@@ -1,7 +1,9 @@
 import { appConfig } from "../config/appConfig";
-import { ChevronDownIcon, FolderIcon, PlayIcon, SettingsIcon } from "./icons";
+import type { Project } from "../project/useProject";
+import { FolderIcon, PlayIcon, SettingsIcon } from "./icons";
 
 interface Props {
+  project: Project;
   running: boolean;
   onRun: () => void;
   onStop: () => void;
@@ -12,8 +14,8 @@ interface Props {
   observeUnavailable: string | null;
 }
 
-/** Header. Run/Stop and Observe are live; the project picker and settings are still placeholders. */
-export function Toolbar({ running, onRun, onStop, observe, onObserveChange, observeUnavailable }: Props) {
+/** Header. Run/Stop and Observe are live; the title shows the open solution; settings is still a placeholder. */
+export function Toolbar({ project, running, onRun, onStop, observe, onObserveChange, observeUnavailable }: Props) {
   return (
     <header className="toolbar">
       <div className="brand">
@@ -21,11 +23,13 @@ export function Toolbar({ running, onRun, onStop, observe, onObserveChange, obse
         <span className="brand-name">{appConfig.name}</span>
       </div>
 
-      <button className="project-picker" disabled title="Projects are not implemented yet">
+      <div className="project-title" title={project.path ?? "Not saved yet"}>
         <FolderIcon />
-        <span>New Project</span>
-        <ChevronDownIcon />
-      </button>
+        <span className="project-name">
+          {project.title}
+          {project.dirty && <span title="Unsaved changes"> ●</span>}
+        </span>
+      </div>
 
       <div className="toolbar-spacer" />
 

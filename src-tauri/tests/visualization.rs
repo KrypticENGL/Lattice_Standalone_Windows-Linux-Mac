@@ -416,7 +416,7 @@ fn a_real_run_reaches_the_view_model() {
     assert_eq!(session.exit_code, Some(0), "{session:#?}");
     let obs = session.workspace_path.as_deref().and_then(|r| service.take(r)).expect("a recording");
     let total = obs.timeline.len() as u64;
-    let graphs: Vec<GraphView> = (0..=total).map(|s| graph_at(&obs, s)).collect();
+    let graphs: Vec<GraphView> = (0..=total).map(|s| graph_at(&obs, s, &[])).collect();
 
     // Step 0: nothing yet. Last step: everything returned, nothing left.
     assert!(graphs[0].threads.is_empty() && graphs[0].objects.is_empty() && graphs[0].event.is_none());
@@ -455,7 +455,7 @@ fn a_real_run_reaches_the_view_model() {
     assert_eq!(pointer_target(&first.slot).object, Some(linked.objects[0].id));
 
     // Clamped past the end, like the text view.
-    assert_eq!(graph_at(&obs, total + 99), *last);
+    assert_eq!(graph_at(&obs, total + 99, &[]), *last);
 }
 
 #[test]

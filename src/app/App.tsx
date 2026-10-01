@@ -7,11 +7,16 @@ import { StatusBar } from "../ui/StatusBar";
 import { Toolbar } from "../ui/Toolbar";
 import { ViewPlaceholder } from "../ui/ViewPlaceholder";
 import { getAppInfo, isNative, type AppInfo } from "../utils/native";
-import { observationStatus, type ObservationStatus } from "../runtime";
+import { observationStatus, type ObservationStatus, type RuntimeSession } from "../runtime";
 import { useExecution } from "../runtime/useExecution";
 import { useRecording } from "../runtime/useRecording";
+import { useInspector } from "../visualization/useInspector";
 import { statusText } from "../runtime/status";
-import { appConfig } from "../config/appConfig";
+import { useProject, type Project } from "../project/useProject";
+import { Dialog } from "../ui/Dialogs";
+import { ContextMenuProvider, SaveArea } from "../ui/ContextMenu";
+import { MenuBar } from "../ui/MenuBar";
+import { SolutionExplorer } from "../ui/SolutionExplorer";
 import { useClangd } from "../lsp/useClangd";
 import { ClangdDialog } from "../ui/ClangdDialog";
 import { EditorView } from "./EditorView";
@@ -19,6 +24,13 @@ import { views, type ViewId } from "./views";
 
 export function App() {
   const [view, setView] = useState<ViewId>("editor");
+  const [explorerOpen, setExplorerOpen] = useState(false);
+  const closeExplorer = useCallback(() => setExplorerOpen(false), []);
+  // Project is a slide-in drawer over the current view; every other entry is a page.
+  const selectView = useCallback((id: ViewId) => {
+    if (id === "project") setExplorerOpen((o) => !o);
+    else setView(id);
+  }, []);
   const [cursor, setCursor] = useState<CursorPosition>({ line: 1, column: 1 });
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [clangdDialog, setClangdDialog] = useState(false);
@@ -28,13 +40,23 @@ export function App() {
   const observeUnavailable = obsStatus && !obsStatus.available ? (obsStatus.hint ?? "Observation is not available.") : null;
   const observe = observeWanted && observeUnavailable === null;
 
-  const getValueRef = useRef<() => string>(() => "");
-  const getSource = useCallback(() => getValueRef.current(), []);
-  const onEditorReady = useCallback((fn: () => string) => {
-    getValueRef.current = fn;
-  }, []);
-  const exec = useExecution(getSource, appConfig.defaultFileName, observe);
-  const recording = useRecording(exec.session);
+  // The project and the execution hook depend on each other (a run reads the project's files;
+  // opening a solution adopts its recording as the current session), so route through a ref.
+  const adoptRef = useRef<(s: RuntimeSession | null) => void>(() => {});
+  const adoptSession = useCallback((s: RuntimeSession | null) => adoptRef.current(s), []);
+  const sessionIdRef = useRef<string | null>(null);
+  const projectRef = useRef<Project>(null as unknown as Project);
+  const project = useProject({ observe: observeWanted, setObserve: setObserveWanted, getSessionId: () => sessionIdRef.current, adoptSession });
+  const getSolution = useCallback(() => ({ name: projectRef.current.title, path: projectRef.current.path }), []);
+  const exec = useExecution(project.getFiles, observe, getSolution);
+  adoptRef.current = exec.adopt;
+  projectRef.current = project;
+  sessionIdRef.current = exec.session?.observation && !exec.session.observation.skipped ? exec.session.id : null;
+  const inspector = useInspector();
+  const recording = useRecording(exec.session, inspector.focus);
+  // A selection belongs to one recording: a new run starts with the inspector closed.
+  const sessionId = exec.session?.id;
+  useEffect(() => inspector.close(), [sessionId, inspector.close]);
 
   // Ctrl+Enter runs (or does nothing while a run is active).
   useEffect(() => {
@@ -48,6 +70,27 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [exec.running, exec.run]);
 
+  // Ctrl+S saves the solution, Ctrl+Shift+S saves as, Ctrl+O opens one, Ctrl+N starts a new one.
+  const { save, saveAs, openFile, newSolution } = project;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k === "s") {
+        e.preventDefault();
+        void (e.shiftKey ? saveAs() : save());
+      } else if (k === "o" && !e.shiftKey) {
+        e.preventDefault();
+        void openFile();
+      } else if (k === "n" && !e.shiftKey) {
+        e.preventDefault();
+        void newSolution();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [save, saveAs, openFile, newSolution]);
+
   useEffect(() => {
     void getAppInfo().then(setInfo);
   }, []);
@@ -59,18 +102,21 @@ export function App() {
       const target = views[Number(e.key) - 1];
       if (target) {
         e.preventDefault();
-        setView(target.id);
+        selectView(target.id);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [selectView]);
 
   const other = views.find((v) => v.id === view && v.description);
 
   return (
+    <ContextMenuProvider>
     <div className="app">
+      <MenuBar project={project} enabled={isNative()} />
       <Toolbar
+        project={project}
         running={exec.running}
         onRun={() => void exec.run()}
         onStop={exec.stop}
@@ -79,16 +125,16 @@ export function App() {
         observeUnavailable={observeUnavailable}
       />
       <div className="body">
-        <Sidebar active={view} onSelect={setView} />
+        <Sidebar active={view} projectOpen={explorerOpen} onSelect={selectView} />
         <main className="content">
           {/* Kept mounted (hidden) so editor state survives view switches. */}
           <div className="view" hidden={view !== "editor"}>
-            <EditorView onCursorChange={setCursor} onEditorReady={onEditorReady} session={exec.session} recording={recording} runError={exec.localError} language={language} onConfigureClangd={() => setClangdDialog(true)} />
+            <EditorView onCursorChange={setCursor} project={project} session={exec.session} recording={recording} inspector={inspector} runError={exec.localError} language={language} onConfigureClangd={() => setClangdDialog(true)} />
           </div>
           {view === "visualizer" && (
-            <div className="view workspace-single">
-              <Panel title="Visualization"><VisualizationCanvas recording={recording} /></Panel>
-            </div>
+            <SaveArea className="view workspace-single" project={project}>
+              <Panel title="Visualization"><VisualizationCanvas recording={recording} inspector={inspector} /></Panel>
+            </SaveArea>
           )}
           {other && (
             <div className="view">
@@ -96,10 +142,13 @@ export function App() {
             </div>
           )}
         </main>
+        <SolutionExplorer project={project} open={explorerOpen} onClose={closeExplorer} refreshKey={exec.session?.id ?? null} />
       </div>
       <StatusBar line={cursor.line} column={cursor.column} info={info} status={statusText(exec.session, exec.running)} language={language} onLanguageClick={() => setClangdDialog(true)} />
+      {project.dialog && <Dialog spec={project.dialog.spec} onDone={project.dialog.done} />}
       {clangdDialog && <ClangdDialog onClose={() => setClangdDialog(false)} />}
     </div>
+    </ContextMenuProvider>
   );
 }
 

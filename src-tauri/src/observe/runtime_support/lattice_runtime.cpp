@@ -21,6 +21,7 @@
 
 #include "lattice_runtime.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -111,6 +112,12 @@ struct Block {
     bool stack = false;
     std::uint64_t owner = 0;  // id of the stack entry (scope/frame) that declared it
     std::string last;         // last reported value, to report only real changes
+    // An allocation made by library code (plain `operator new`) is remembered but not
+    // announced: it becomes an object once a typed pointer to its start is seen (what
+    // the block *is* is only known from what points at it).
+    bool announced = true;
+    // The block's bytes as last reported: `sync` compares memory with this.
+    std::vector<unsigned char> bytes;
 };
 
 // The runtime's view of the call stack: function frames and lexical scopes, in
@@ -143,7 +150,15 @@ struct State {
     std::vector<Entry> stack;
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     std::vector<TypeRec> types;  // index == TypeId; [0] unused
+    // Array types by (element, length), so the `int[5]` of a `new int[5]` and of a
+    // declared `int a[5]` are one type.
+    std::map<std::pair<TypeId, std::size_t>, TypeId> array_types;
     std::map<std::uintptr_t, Block> live;
+    // `sync` compares every tracked block, so its cost grows with the amount of tracked
+    // memory. To keep the cost per statement bounded, with a lot of state it runs every
+    // `sync_stride` statements instead of every one (see `sync`).
+    std::uint64_t sync_stride = 1;
+    std::uint64_t sync_wait = 0;
     std::unordered_map<std::uintptr_t, Site> pending_delete;
     // Events waiting to be written. Guarded by `mu`, like everything else.
     std::string buf;
@@ -165,6 +180,7 @@ void flush_locked(State& st) {
 State& S();
 
 void flush_now() {
+    Guard g;
     State& st = S();
     Locked lock(st.mu);
     flush_locked(st);
@@ -173,6 +189,7 @@ void flush_now() {
 // Crash paths: best effort. If the interrupted code held the lock we write
 // anyway; losing ordering is better than losing the tail of the run.
 void flush_crash() {
+    Guard g;
     State& st = S();
     bool locked = st.mu.try_lock();
     flush_locked(st);
@@ -195,6 +212,7 @@ void on_abort(int sig) {
 // dependency that not every toolchain satisfies implicitly.)
 DWORD WINAPI flusher(LPVOID param) {
     State* st = static_cast<State*>(param);
+    t_inside = true;  // this thread's own allocations are never the program's
     for (;;) {
         Sleep(20);
         Locked lock(st->mu);
@@ -419,6 +437,32 @@ void emit_type_declared(State& st, TypeId id) {
     emit(st, nullptr, k);
 }
 
+// The array type `elem[len]`, declared on first use. `new T[n]` has a length only at
+// run time, so unlike every other type it cannot come from a compile-time `type_id<T>()`.
+TypeId array_type_of(State& st, TypeId elem, std::size_t len) {
+    auto key = std::make_pair(elem, len);
+    auto known = st.array_types.find(key);
+    if (known != st.array_types.end()) return known->second;
+    st.types.emplace_back();
+    TypeId id = static_cast<TypeId>(st.types.size() - 1);
+    // Resolved before the registry is touched again: `emplace_back` may move `types`.
+    const std::string en = st.types[elem].name.empty() ? std::string("?") : st.types[elem].name;
+    const std::size_t esize = st.types[elem].size;
+    TypeRec& t = st.types[id];
+    t.kind = Kind::Array;
+    t.elem = elem;
+    t.len = len;
+    t.size = esize * len;
+    // `int[4]` elements make `int[n][4]`: the new extent is the outermost one.
+    const std::size_t bracket = en.find('[');
+    t.name = bracket == std::string::npos
+                 ? en + "[" + std::to_string(len) + "]"
+                 : en.substr(0, bracket) + "[" + std::to_string(len) + "]" + en.substr(bracket);
+    st.array_types[key] = id;
+    emit_type_declared(st, id);
+    return id;
+}
+
 // ---- values -------------------------------------------------------------
 
 void unavailable(std::string& o, const char* reason) {
@@ -481,8 +525,20 @@ Located locate(const State& st, std::uintptr_t addr, TypeId want) {
     if (it == st.live.begin()) return r;
     --it;
     const Block& b = it->second;
+    if (!b.announced) return r;  // library storage nothing typed has pointed at yet
     std::size_t off = addr - it->first;
-    if (off >= b.size) return r;  // includes one-past-the-end: not a tracked place
+    if (off >= b.size) {
+        // One past the end of an array (a container's `end`/`last` pointer): a place the
+        // model knows as out of bounds, so the link to the array is not lost. Anything else
+        // past a block is not a tracked place.
+        const TypeRec& t = st.types[b.type];
+        if (off == b.size && t.kind == Kind::Array && t.elem == want && t.len > 0) {
+            r.object = b.id;
+            r.path = {{false, t.len}};
+            r.ok = true;
+        }
+        return r;
+    }
     r.object = b.id;
     if (resolve(st, b.type, off, want, r.path)) {
         r.ok = true;
@@ -698,6 +754,167 @@ void destroy_block(State& st, std::map<std::uintptr_t, Block>::iterator it) {
     st.live.erase(it);
 }
 
+// ---- snapshots, adoption of library storage, change detection -------------------------------
+
+constexpr std::size_t kMaxSnapshotBytes = 1u << 20;  // larger blocks are not compared
+constexpr std::size_t kMaxRawBytes = 16u << 20;      // larger library allocations are not remembered
+constexpr int kMaxAdoptDepth = 24;
+// Per-statement budget of `sync`, in bytes compared (a block also costs `kBlockCost` for
+// walking to it), and the longest it waits between comparisons.
+constexpr std::uint64_t kSyncBudget = 32 * 1024;
+constexpr std::uint64_t kBlockCost = 64;
+constexpr std::uint64_t kMaxSyncStride = 256;
+
+const unsigned char* mem_of(std::uintptr_t a) { return reinterpret_cast<const unsigned char*>(a); }
+
+void snap_all(Block& b, std::uintptr_t base) {
+    if (b.size > kMaxSnapshotBytes) {
+        b.bytes.clear();
+        return;
+    }
+    b.bytes.assign(mem_of(base), mem_of(base) + b.size);
+}
+
+// The bytes `[addr, addr + len)` of the block at `base` were just reported: remember them.
+void snap_range(Block& b, std::uintptr_t base, std::uintptr_t addr, std::size_t len) {
+    if (b.bytes.size() != b.size) {
+        snap_all(b, base);
+        return;
+    }
+    const std::size_t off = addr - base;
+    if (off + len > b.size) return;
+    std::memcpy(b.bytes.data() + off, mem_of(addr), len);
+}
+
+void adopt_value(State& st, const Site* site, TypeId type, const unsigned char* p, int depth);
+
+// Library storage that a typed pointer points at the start of becomes an object: an
+// array `T[n]`. Announced with its shape first
+// and its contents after, so that pointers inside it, to storage not yet announced or to
+// itself, always find their target already known.
+bool announce(State& st, const Site* site, std::map<std::uintptr_t, Block>::iterator it, TypeId pointee, int depth) {
+    Block& b = it->second;
+    if (b.announced) return false;
+    std::size_t esize;
+    {
+        const TypeRec& pt = st.types[pointee];
+        if (pt.kind == Kind::Undefined || pt.kind == Kind::Defining || pt.kind == Kind::Opaque ||
+            pt.kind == Kind::Reference) {
+            return false;
+        }
+        esize = pt.size;
+    }
+    if (esize == 0 || b.size % esize != 0) return false;
+    const std::size_t n = b.size / esize;
+    if (n > kMaxArrayElements) return false;
+    // Always an array, even of one: what library code points at the start of is a buffer.
+    const TypeId ty = array_type_of(st, pointee, n);
+    const std::uintptr_t addr = it->first;
+    b.announced = true;
+    b.constructed = true;
+    b.type = ty;
+    b.id = st.next_object++;
+
+    std::string k = "{\"event\":\"object_allocated\",\"object\":{\"id\":" + std::to_string(b.id);
+    k += ",\"ty\":" + std::to_string(ty);
+    k += ",\"storage\":\"heap\",\"address\":" + std::to_string(addr);
+    k += ",\"size\":" + std::to_string(b.size);
+    k += ",\"state\":\"alive\",\"value\":";
+    shape_json(k, st, ty);
+    k += "}}";
+    emit(st, site, k);
+    adopt_value(st, site, ty, mem_of(addr), depth + 1);
+    std::string v;
+    value_json(v, st, ty, mem_of(addr));
+    emit_value_changed(st, site, b.id, {}, v);
+    snap_all(it->second, addr);
+    return true;
+}
+
+// Before reporting a value, make objects of the library storage it points at. Pointers
+// are only followed to the *start* of a block: an interior pointer says nothing of the
+// block's element type.
+void adopt_value(State& st, const Site* site, TypeId type, const unsigned char* p, int depth) {
+    if (depth > kMaxAdoptDepth) return;
+    switch (st.types[type].kind) {
+        case Kind::Pointer: {
+            const TypeId elem = st.types[type].elem;
+            const std::uintptr_t v = load<std::uintptr_t>(p);
+            if (v == 0) return;
+            auto it = st.live.find(v);
+            if (it != st.live.end() && !it->second.announced) announce(st, site, it, elem, depth);
+            return;
+        }
+        case Kind::Record: {
+            const std::size_t nf = st.types[type].fields.size();
+            for (std::size_t i = 0; i < nf; ++i) {
+                const FieldRec f = st.types[type].fields[i];
+                adopt_value(st, site, f.type, p + f.offset, depth + 1);
+            }
+            return;
+        }
+        case Kind::Array: {
+            const TypeId elem = st.types[type].elem;
+            const std::size_t len = st.types[type].len;
+            const Kind ek = st.types[elem].kind;
+            if (ek == Kind::Primitive || ek == Kind::Enum) return;
+            const std::size_t esize = st.types[elem].size;
+            if (esize == 0 || len > kMaxArrayElements) return;
+            for (std::size_t i = 0; i < len; ++i) adopt_value(st, site, elem, p + i * esize, depth + 1);
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+// Report, as value changes, the parts of block `b` (at `base`) that differ from its
+// snapshot: down to the field or element, not the whole object.
+void diff_emit(State& st, const Site* site, Block& b, std::uintptr_t base, TypeId type, std::size_t off,
+               std::vector<Step>& path) {
+    const Kind kind = st.types[type].kind;
+    const std::size_t size = st.types[type].size;
+    if (size == 0 || off + size > b.size) return;
+    if (std::memcmp(mem_of(base) + off, b.bytes.data() + off, size) == 0) return;
+    if (kind == Kind::Record) {
+        const std::size_t nf = st.types[type].fields.size();
+        for (std::size_t i = 0; i < nf; ++i) {
+            const FieldRec f = st.types[type].fields[i];
+            path.push_back({true, i});
+            diff_emit(st, site, b, base, f.type, off + f.offset, path);
+            path.pop_back();
+        }
+        return;
+    }
+    if (kind == Kind::Array) {
+        const TypeId elem = st.types[type].elem;
+        const std::size_t len = st.types[type].len;
+        const std::size_t esize = st.types[elem].size;
+        if (esize == 0 || len > kMaxArrayElements) return;
+        for (std::size_t i = 0; i < len; ++i) {
+            path.push_back({false, i});
+            diff_emit(st, site, b, base, elem, off + i * esize, path);
+            path.pop_back();
+        }
+        return;
+    }
+    if (kind == Kind::Opaque || kind == Kind::Reference || kind == Kind::Undefined || kind == Kind::Defining) return;
+    adopt_value(st, site, type, mem_of(base) + off, 0);
+    std::string v;
+    value_json(v, st, type, mem_of(base) + off);
+    emit_value_changed(st, site, b.id, path, v);
+}
+
+// The tracked block containing `addr`, with its base address; null if none.
+Block* block_at(State& st, std::uintptr_t addr, std::uintptr_t* base) {
+    auto it = st.live.upper_bound(addr);
+    if (it == st.live.begin()) return nullptr;
+    --it;
+    if (!it->second.announced || addr - it->first >= it->second.size) return nullptr;
+    *base = it->first;
+    return &it->second;
+}
+
 }  // namespace
 
 // ---- detail: types ---------------------------------------------------------
@@ -775,6 +992,7 @@ void define_array(TypeId id, TypeId element, std::size_t len, std::size_t size) 
     t.size = size;
     const std::string& en = st.types[element].name;
     t.name = (en.empty() ? std::string("?") : en) + "[" + std::to_string(len) + "]";
+    st.array_types.emplace(std::make_pair(element, len), id);
     emit_type_declared(st, id);
 }
 
@@ -813,6 +1031,62 @@ void define_reference(TypeId id, TypeId referent, std::size_t size) {
     const std::string& en = st.types[referent].name;
     t.name = (en.empty() ? std::string("?") : en) + "&";
     emit_type_declared(st, id);
+}
+
+namespace {
+
+TypeId build_layout_node(const Layout& l, const ExtFn* ext, std::vector<TypeId>& ids, std::uint32_t i,
+                         TypeId root_id) {
+    if (i >= l.count) return 0;
+    if (ids[i] != 0) return ids[i];
+    const LNode& n = l.nodes[i];
+    if (n.kind == LKind::Prim) return ids[i] = prim_type_id(n.prim);
+    if (n.kind == LKind::External) {
+        TypeId t = (ext != nullptr && ext[n.ref] != nullptr) ? ext[n.ref]() : 0;
+        if (t != 0) return ids[i] = t;
+    }
+    const TypeId id = (i == l.root) ? root_id : reserve_type();
+    ids[i] = id;
+    switch (n.kind) {
+        case LKind::Pointer: {
+            const TypeId pointee = build_layout_node(l, ext, ids, n.ref, root_id);
+            define_pointer(id, pointee, n.size);
+            break;
+        }
+        case LKind::Array: {
+            const TypeId elem = build_layout_node(l, ext, ids, n.ref, root_id);
+            define_array(id, elem, n.count, n.size);
+            break;
+        }
+        case LKind::Record: {
+            // Named first: pointers back to this record (a list node's `next`) take their
+            // name from it.
+            set_name(id, n.name, std::strlen(n.name));
+            std::vector<FieldInfo> fields;
+            for (std::uint32_t f = 0; f < n.count; ++f) {
+                const LField& lf = n.fields[f];
+                fields.push_back({lf.name, build_layout_node(l, ext, ids, lf.type, root_id), lf.offset});
+            }
+            define_record(id, n.size, fields.data(), fields.size());
+            break;
+        }
+        case LKind::Enum:
+            set_name(id, n.name, std::strlen(n.name));
+            define_enum(id, n.size, n.is_signed);
+            break;
+        default:  // Opaque, or an External that could not be resolved
+            set_name(id, n.name, std::strlen(n.name));
+            define_opaque(id, n.size);
+            break;
+    }
+    return id;
+}
+
+}  // namespace
+
+void define_from_layout(TypeId id, const Layout& l, const ExtFn* ext) {
+    std::vector<TypeId> ids(l.count, 0);
+    build_layout_node(l, ext, ids, l.root, id);
 }
 
 // ---- detail: frames, scopes, variables -------------------------------------------
@@ -944,17 +1218,20 @@ void declare(VarKind kind, const char* name, TypeId type, const void* address, s
     if (known != st.live.end() && known->second.stack && known->second.owner == top.id &&
         known->second.type == type) {
         if (!uninitialized) {
+            adopt_value(st, &site, type, mem, 0);
             std::string v;
             value_json(v, st, type, mem);
             if (v != known->second.last) {
                 known->second.last = v;
                 emit_value_changed(st, &site, known->second.id, {}, v);
             }
+            snap_all(known->second, addr);
         }
         return;
     }
 
     evict_stale_stack_blocks(st, addr, size);
+    if (!uninitialized) adopt_value(st, &site, type, mem, 0);
     std::uint64_t object = st.next_object++;
     std::string value;
     if (uninitialized) {
@@ -963,6 +1240,7 @@ void declare(VarKind kind, const char* name, TypeId type, const void* address, s
         value_json(value, st, type, mem);
     }
     st.live[addr] = Block{object, size, type, true, site, true, top.id, uninitialized ? std::string() : value};
+    snap_all(st.live[addr], addr);
 
     std::string k = "{\"event\":\"object_allocated\",\"object\":{\"id\":" + std::to_string(object);
     k += ",\"ty\":" + std::to_string(type);
@@ -1019,10 +1297,13 @@ void after_write(const void* address, TypeId type, const Site& site) {
     if (!st.enabled) return;
     auto addr = reinterpret_cast<std::uintptr_t>(address);
     Located l = locate(st, addr, type);
-    if (!l.ok) return;  // not inside a tracked object (e.g. a stack variable): not observed yet
+    if (!l.ok) return;  // not inside a tracked object
+    adopt_value(st, &site, type, static_cast<const unsigned char*>(address), 0);
     std::string value;
     value_json(value, st, type, static_cast<const unsigned char*>(address));
     emit_value_changed(st, &site, l.object, l.path, value);
+    std::uintptr_t base = 0;
+    if (Block* b = block_at(st, addr, &base)) snap_range(*b, base, addr, st.types[type].size);
 }
 
 void note_delete(const void* address, const Site& site) {
@@ -1032,7 +1313,8 @@ void note_delete(const void* address, const Site& site) {
     Locked lock(st.mu);
     if (!st.enabled) return;
     auto addr = reinterpret_cast<std::uintptr_t>(address);
-    if (st.live.count(addr)) st.pending_delete[addr] = site;
+    auto it = st.live.find(addr);
+    if (it != st.live.end() && it->second.announced) st.pending_delete[addr] = site;
 }
 
 void constructed(const void* address) {
@@ -1050,8 +1332,9 @@ void constructed(const void* address) {
     // The constructor has run: report what it left behind. The constructor's own
     // writes happened before this point and were not individually observed (only
     // assignments in instrumented code are), so this is the authoritative value.
-    const TypeRec& t = st.types[b.type];
     const auto* base = static_cast<const unsigned char*>(address);
+    adopt_value(st, &b.site, b.type, base, 0);
+    const TypeRec& t = st.types[b.type];
     if (t.kind == Kind::Record) {
         for (std::size_t i = 0; i < t.fields.size(); ++i) {
             std::string v;
@@ -1063,6 +1346,49 @@ void constructed(const void* address) {
         value_json(v, st, b.type, base);
         emit_value_changed(st, &b.site, b.id, {}, v);
     }
+    snap_all(b, it->first);
+}
+
+void constructed_uninit(const void* address) {
+    if (t_inside || address == nullptr) return;
+    Guard g;
+    State& st = S();
+    Locked lock(st.mu);
+    if (!st.enabled) return;
+    auto it = st.live.find(reinterpret_cast<std::uintptr_t>(address));
+    if (it == st.live.end() || it->second.constructed) return;
+    it->second.constructed = true;
+    snap_all(it->second, it->first);
+    // The shape reported at allocation (every element "uninitialized") stays true.
+    emit(st, &it->second.site, "{\"event\":\"object_constructed\",\"object\":" + std::to_string(it->second.id) + "}");
+}
+
+void sync(const Site& site) {
+    if (t_inside) return;
+    Guard g;
+    State& st = S();
+    Locked lock(st.mu);
+    if (!st.enabled || st.stack.empty()) return;
+    if (st.sync_wait > 0) {
+        --st.sync_wait;
+        return;
+    }
+    std::vector<Step> path;
+    std::uint64_t cost = 0;
+    for (auto it = st.live.begin(); it != st.live.end(); ++it) {
+        Block& b = it->second;
+        if (!b.announced || b.bytes.size() != b.size) continue;
+        cost += b.size + kBlockCost;
+        if (std::memcmp(mem_of(it->first), b.bytes.data(), b.size) == 0) continue;
+        path.clear();
+        diff_emit(st, &site, b, it->first, b.type, 0, path);
+        snap_all(b, it->first);
+    }
+    // Exact while the tracked state is small (every statement); with more of it, every
+    // n-th statement, so that the work per statement stays about the same. A change then
+    // shows up at the next comparison rather than at the statement that made it.
+    st.sync_stride = std::min<std::uint64_t>(std::max<std::uint64_t>(cost / kSyncBudget, 1), kMaxSyncStride);
+    st.sync_wait = st.sync_stride - 1;
 }
 
 }  // namespace detail
@@ -1093,16 +1419,45 @@ void release(void* p) noexcept {
         Locked lock(st.mu);
         if (st.enabled) {
             auto it = st.live.find(reinterpret_cast<std::uintptr_t>(p));
-            if (it != st.live.end()) destroy_block(st, it);
+            if (it != st.live.end()) {
+                if (it->second.announced) {
+                    destroy_block(st, it);
+                } else {
+                    st.live.erase(it);  // never became an object: nothing to report
+                }
+            }
         }
     }
     std::free(p);
 }
 
+// Remember an allocation made by library code (plain `operator new`) while observed code
+// is running, so that it can become an object once something typed points at it.
+void track_raw(void* p, std::size_t size) {
+    using namespace lattice::rt;
+    if (p == nullptr || t_inside || size == 0 || size > kMaxRawBytes) return;
+    Guard g;
+    State& st = S();
+    Locked lock(st.mu);
+    if (!st.enabled || st.stack.empty()) return;
+    Block b{};
+    b.size = size;
+    b.announced = false;
+    st.live[reinterpret_cast<std::uintptr_t>(p)] = std::move(b);
+}
+
 }  // namespace
 
-void* operator new(std::size_t size) { return raw_allocate(size); }
-void* operator new[](std::size_t size) { return raw_allocate(size); }
+void* operator new(std::size_t size) {
+    void* p = raw_allocate(size);
+    track_raw(p, size);
+    return p;
+}
+void* operator new[](std::size_t size) {
+    void* p = raw_allocate(size);
+    track_raw(p, size);
+    return p;
+}
 void operator delete(void* p) noexcept { release(p); }
 void operator delete[](void* p) noexcept { release(p); }
 void operator delete(void* p, std::size_t) noexcept { release(p); }
@@ -1133,3 +1488,31 @@ void* operator new(std::size_t size, const lattice::rt::NewTag& tag) {
 
 // Called by the language if the constructor of a tagged `new` throws.
 void operator delete(void* p, const lattice::rt::NewTag&) noexcept { release(p); }
+
+// `new T[n]`: the block becomes one array object `T[n]` (the length is size / sizeof(T)).
+// Anything that does not fit that picture stays an ordinary, untracked allocation.
+void* operator new[](std::size_t size, const lattice::rt::NewTag& tag) {
+    using namespace lattice::rt;
+    void* p = raw_allocate(size);
+    if (t_inside || tag.type == 0 || tag.elem_size == 0) return p;
+    const std::size_t len = size / tag.elem_size;
+    if (len == 0 || size % tag.elem_size != 0 || len > kMaxArrayElements) return p;
+    Guard g;
+    State& st = S();
+    Locked lock(st.mu);
+    if (!st.enabled) return p;
+    TypeId array = array_type_of(st, tag.type, len);
+    std::uint64_t id = st.next_object++;
+    st.live[reinterpret_cast<std::uintptr_t>(p)] = Block{id, size, array, false, tag.site, false, 0, std::string()};
+    std::string k = "{\"event\":\"object_allocated\",\"object\":{\"id\":" + std::to_string(id);
+    k += ",\"ty\":" + std::to_string(array);
+    k += ",\"storage\":\"heap\",\"address\":" + std::to_string(reinterpret_cast<std::uintptr_t>(p));
+    k += ",\"size\":" + std::to_string(size);
+    k += ",\"state\":\"allocated\",\"value\":";
+    shape_json(k, st, array);
+    k += "}}";
+    emit(st, &tag.site, k);
+    return p;
+}
+
+void operator delete[](void* p, const lattice::rt::NewTag&) noexcept { release(p); }

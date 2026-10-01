@@ -109,6 +109,17 @@ impl ExecutionManager {
     /// Compile and run `request`. Blocks until the session ends; call from a
     /// worker thread. The returned session is always in a terminal state.
     pub fn run(&self, request: RunRequest, observer: StateObserver<'_>) -> RuntimeSession {
+        self.run_into(request, None, observer)
+    }
+
+    /// Like [`run`](Self::run), and keeps a copy of the built executable in `output_dir`
+    /// (a solution's `target` folder) before the temporary workspace is cleaned up.
+    pub fn run_into(
+        &self,
+        request: RunRequest,
+        output_dir: Option<&std::path::Path>,
+        observer: StateObserver<'_>,
+    ) -> RuntimeSession {
         let id = SessionId::new();
         let cancel = CancelToken::new();
         self.active.lock().unwrap().insert(id.clone(), cancel.clone());
@@ -122,7 +133,7 @@ impl ExecutionManager {
         );
         info!(session = %id, files = request.files.len(), "session created");
 
-        let workspace = self.execute(&mut session, &request, &cancel, observer);
+        let workspace = self.execute(&mut session, &request, &cancel, observer, output_dir);
         self.cleanup(&mut session, workspace);
         self.active.lock().unwrap().remove(&id);
 
@@ -155,6 +166,7 @@ impl ExecutionManager {
         request: &RunRequest,
         cancel: &CancelToken,
         observer: StateObserver<'_>,
+        output_dir: Option<&std::path::Path>,
     ) -> Option<Workspace> {
         // --- validate ---------------------------------------------------------
         if let Some(err) = request.files.iter().find_map(|f| f.validate().err()) {
@@ -266,6 +278,16 @@ impl ExecutionManager {
             }
         }
         session.executable_path = Some(exe.clone());
+        if let Some(dir) = output_dir {
+            // Best effort: a read-only target folder must not fail the run.
+            let copy = std::fs::create_dir_all(dir)
+                .and_then(|_| std::fs::copy(&exe, dir.join(exe.file_name().unwrap_or_default())));
+            if let Err(e) = copy {
+                warn!(session = %session.id, error = %e, "could not keep the executable in the target folder");
+            } else {
+                session.executable_path = Some(dir.join(exe.file_name().unwrap_or_default()));
+            }
+        }
         Self::set_state(session, SessionState::Ready, observer);
 
         // --- run ----------------------------------------------------------------

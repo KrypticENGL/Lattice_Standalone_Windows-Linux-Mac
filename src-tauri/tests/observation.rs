@@ -332,9 +332,13 @@ fn programs_using_the_standard_library_keep_working() {
     assert_eq!(session.stdout.trim_end(), "hi 3");
     assert!(obs.summary.skipped.is_none(), "{:?}", obs.summary.skipped);
     assert!(obs.issues.is_empty(), "{:?}", obs.issues);
-    // Only user code is instrumented; std::vector / std::string internals are not.
+    // Only user code is instrumented, but what the library allocates is seen once something
+    // typed points at it: the vector's buffer (heap object 1, filled by its constructor and
+    // freed with it) comes first, then the user's Node. `std::string` kept "hi" inline: no heap.
     assert_eq!(outline(&obs.timeline), [
-        "allocated 1", "constructed 1", "changed 1.0", "changed 1.1", "changed 1.1", "destroyed 1"
+        "allocated 1", "changed 1",
+        "allocated 2", "constructed 2", "changed 2.0", "changed 2.1", "changed 2.1",
+        "destroyed 2", "destroyed 1",
     ]);
 }
 

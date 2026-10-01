@@ -8,6 +8,7 @@
 //! - [`viz`]       view model: one URR snapshot as layout-free data for a renderer
 //! - [`observe`]   runtime observation: libclang analysis, source instrumentation, event receiver
 //! - [`process`]   OS process execution with capture, timeout and tree-kill
+//! - [`solution`]  the `.lattice` file: sources, settings and the recorded URR state
 //! - [`toolchain`] compiler abstraction and discovery
 //! - [`runtime`]   sessions: workspace, compile, run; future instrumentation seam
 
@@ -18,6 +19,7 @@ pub mod model;
 pub mod observe;
 pub mod process;
 pub mod runtime;
+pub mod solution;
 pub mod toolchain;
 pub mod viz;
 
@@ -63,6 +65,7 @@ pub fn run() {
             app::commands::observation_status,
             app::commands::observation_step,
             app::commands::observation_graph,
+            app::commands::observation_timeline,
             app::commands::stop_program,
             app::commands::toolchain_status,
             app::commands::rescan_toolchain,
@@ -73,6 +76,11 @@ pub fn run() {
             app::commands::clangd_send,
             app::commands::clangd_stop,
             app::commands::read_source_file,
+            app::commands::solution_save,
+            app::commands::solution_open,
+            app::commands::fs_list_dir,
+            app::commands::fs_roots,
+            app::commands::fs_create_dir,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Lattice");

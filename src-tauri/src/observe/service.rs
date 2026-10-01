@@ -162,17 +162,24 @@ impl ObserverProvider for ObservationService {
 }
 
 /// The recorded run after `step` events as data for the visualization (see
-/// [`crate::viz`]). `step` is clamped to the length of the run.
-pub fn graph_at(obs: &Observation, step: u64) -> crate::viz::GraphView {
+/// [`crate::viz`]). `step` is clamped to the length of the run. `focus` lists object ids
+/// the caller is inspecting; they come back in `GraphView::focus` whether or not they
+/// are drawn.
+pub fn graph_at(obs: &Observation, step: u64, focus: &[u64]) -> crate::viz::GraphView {
     let total = obs.timeline.len() as u64;
     let step = step.min(total);
     if step == 0 {
-        return crate::viz::build(&obs.timeline.initial(), None, None, 0, total);
+        let initial = obs.timeline.initial();
+        let mut g = crate::viz::build(&initial, None, None, 0, total);
+        g.focus = crate::viz::object_views(&initial, focus);
+        return g;
     }
     let snap = obs.timeline.snapshot_after(EventSeq(step - 1)).expect("step is within the timeline");
     let event = obs.timeline.events().get((step - 1) as usize);
     let text = event.map(|e| event_line(e, &snap));
-    crate::viz::build(&snap, event, text, step, total)
+    let mut g = crate::viz::build(&snap, event, text, step, total);
+    g.focus = crate::viz::object_views(&snap, focus);
+    g
 }
 
 /// The recorded run after `step` events, rendered as text. `step` is clamped to

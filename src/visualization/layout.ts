@@ -76,6 +76,9 @@ export interface BoxLayout {
   /** The frame that is executing. */
   current: boolean;
   objectId: number | null;
+  /** Frames: which frame this box is, and its function (what a click selects). */
+  frameId: number | null;
+  function: string | null;
 }
 
 export interface Point {
@@ -200,7 +203,10 @@ function finish(draft: Draft, m: Metrics, titleChars: number): void {
 }
 
 function emptyBox(key: string, kind: BoxLayout["kind"], title: string, subtitle: string | null): BoxLayout {
-  return { key, kind, title, subtitle, x: 0, y: 0, w: 0, h: 0, rows: [], state: null, changed: false, current: false, objectId: null };
+  return {
+    key, kind, title, subtitle, x: 0, y: 0, w: 0, h: 0, rows: [], state: null, changed: false, current: false,
+    objectId: null, frameId: null, function: null,
+  };
 }
 
 // ---- layout ------------------------------------------------------------------
@@ -224,6 +230,8 @@ export function layoutGraph(g: GraphView, m: Metrics): Layout {
       box.rows = f.variables.flatMap((v) => variableRows(v, changed));
       box.current = i === t.frames.length - 1;
       box.changed = changed.has(`frame:${f.id}`);
+      box.frameId = f.id;
+      box.function = f.function;
       const d: Draft = { box, pointers: [] };
       finish(d, m, title.length + (box.subtitle ? box.subtitle.length + 2 : 0));
       stack.push(d);

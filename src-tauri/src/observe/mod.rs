@@ -19,12 +19,15 @@
 pub mod analysis;
 pub mod discovery;
 mod instrumenter;
+pub mod layout;
 pub mod libclang;
 pub mod pipe;
 pub mod receiver;
 pub mod report;
 pub mod rewrite;
 mod service;
+pub mod steps;
 
 pub use instrumenter::{InstrumentationSummary, Observation, ObservingInstrumenter, Transport};
+pub use steps::{aggregate, StepKind, TimelineStep};
 pub use service::{graph_at, view_at, ObservationService, ObservationStatus, StepView, DEFAULT_EVENT_LIMIT};

@@ -47,10 +47,51 @@ enum class Prim : std::uint8_t {
     LongLong, UnsignedLongLong, Float, Double, LongDouble
 };
 
+// ---- layouts ---------------------------------------------------------------
+// The compiler's own description of a type the instrumenter does not generate a
+// descriptor for (a library class, a template instantiation): plain data, produced by
+// the analysis, turned into a type description by `detail::define_from_layout`.
+enum class LKind : std::uint8_t { Prim, Enum, Pointer, Array, Record, Opaque, External };
+
+struct LField {
+    const char* name;
+    std::uint32_t offset;  // bytes from the start of the record
+    std::uint32_t type;    // node index
+};
+
+struct LNode {
+    LKind kind;
+    Prim prim;           // Prim
+    bool is_signed;      // Prim, Enum
+    std::uint32_t size;
+    const char* name;
+    std::uint32_t ref;   // Pointer: pointee node; Array: element node; External: slot
+    std::uint32_t count; // Array: length; Record: number of fields
+    const LField* fields;
+};
+
+struct Layout {
+    const LNode* nodes;
+    std::uint32_t count;
+    std::uint32_t root;
+};
+
+using ExtFn = TypeId (*)();
+
+// A layout and the project types it refers to (`External` nodes index `ext`).
+struct LayoutRef {
+    const Layout* layout = nullptr;
+    const ExtFn* ext = nullptr;
+};
+
 // Argument of the placement allocation function our `new` rewrite selects.
+// For `new T[n]` (`elem_size != 0`) `type` is the *element* type: the length is only
+// known to the allocation function, as `size / elem_size`. `type == 0` means "do not
+// track this allocation".
 struct NewTag {
     Site site;
     TypeId type;
+    std::size_t elem_size;
 };
 
 namespace detail {
@@ -82,6 +123,18 @@ void declare_reference(VarKind kind, const char* name, TypeId ref_type, TypeId r
 void after_write(const void* address, TypeId type, const Site& site);
 void note_delete(const void* address, const Site& site);
 void constructed(const void* address);
+// Like `constructed`, for storage whose content is still indeterminate (default-
+// initialized scalars): the object is alive but its elements stay "uninitialized".
+void constructed_uninit(const void* address);
+
+// Describe `id` (already reserved, and being defined by the caller) from a layout.
+void define_from_layout(TypeId id, const Layout& layout, const ExtFn* ext);
+// The type id the program's own `int`, `char`, ... has: layouts share it, so a pointer
+// typed by a layout and one typed by the program's code agree on what they point at.
+TypeId prim_type_id(Prim prim);
+
+// Compare tracked memory with what was last reported and report the differences.
+void sync(const Site& site);
 }  // namespace detail
 
 template <class T>
@@ -101,7 +154,7 @@ constexpr std::string_view pretty_name() {
 }
 
 template <class T>
-TypeId type_id();
+TypeId type_id(const LayoutRef& layout = LayoutRef{});
 
 // Class and union types are described by a generated function found through
 // argument-dependent lookup (see the instrumenter). Anything without one is opaque.
@@ -176,11 +229,54 @@ void describe_type(TypeId id) {
 }
 
 template <class T>
-TypeId type_id() {
+TypeId type_id(const LayoutRef& layout) {
     using U = std::remove_cv_t<T>;
     static const TypeId id = detail::reserve_type();
-    if (detail::begin_define(id)) describe_type<U>(id);
+    if (detail::begin_define(id)) {
+        if (layout.layout != nullptr) {
+            detail::define_from_layout(id, *layout.layout, layout.ext);
+        } else {
+            describe_type<U>(id);
+        }
+    }
     return id;
+}
+
+template <class T>
+TypeId ext_id() {
+    return type_id<T>();
+}
+
+// A layout with the project types it names (see `LayoutRef`).
+template <class... Ts>
+LayoutRef lay(const Layout& layout) {
+    static const ExtFn fns[] = {&ext_id<Ts>..., nullptr};
+    return LayoutRef{&layout, fns};
+}
+
+inline TypeId detail::prim_type_id(Prim p) {
+    switch (p) {
+        case Prim::Bool: return type_id<bool>();
+        case Prim::Char: return type_id<char>();
+        case Prim::SignedChar: return type_id<signed char>();
+        case Prim::UnsignedChar: return type_id<unsigned char>();
+        case Prim::WChar: return type_id<wchar_t>();
+        case Prim::Char8: return type_id<char>();
+        case Prim::Char16: return type_id<char16_t>();
+        case Prim::Char32: return type_id<char32_t>();
+        case Prim::Short: return type_id<short>();
+        case Prim::UnsignedShort: return type_id<unsigned short>();
+        case Prim::Int: return type_id<int>();
+        case Prim::UnsignedInt: return type_id<unsigned>();
+        case Prim::Long: return type_id<long>();
+        case Prim::UnsignedLong: return type_id<unsigned long>();
+        case Prim::LongLong: return type_id<long long>();
+        case Prim::UnsignedLongLong: return type_id<unsigned long long>();
+        case Prim::Float: return type_id<float>();
+        case Prim::Double: return type_id<double>();
+        case Prim::LongDouble: return type_id<long double>();
+    }
+    return type_id<int>();
 }
 
 // A plain address from a pointer of any cv-qualification (a `volatile int*` does
@@ -193,14 +289,34 @@ const void* raw(T* p) {
 // ---- generated-code entry points ------------------------------------------
 
 template <class T>
-NewTag tag(const Site& site) {
-    return NewTag{site, type_id<T>()};
+NewTag tag(const Site& site, const LayoutRef& layout = LayoutRef{}) {
+    return NewTag{site, type_id<T>(layout), 0};
+}
+
+// `new T[n]`. A type with a non-trivial destructor makes the compiler prepend an array
+// cookie to the allocation and hand back an interior pointer, so the block would no
+// longer be the array: those allocations are left untracked (`type == 0`).
+template <class T>
+NewTag tag_array(const Site& site, const LayoutRef& layout = LayoutRef{}) {
+    if constexpr (std::is_trivially_destructible_v<T>) {
+        return NewTag{site, type_id<T>(layout), sizeof(T)};
+    } else {
+        return NewTag{site, 0, 0};
+    }
 }
 
 // Wraps a whole `new` expression: the object has finished constructing.
 template <class T>
 T* constructed(T* p) {
     detail::constructed(raw(p));
+    return p;
+}
+
+// Wraps a whole `new T[n]` expression with no initializer: the elements of a scalar
+// type are indeterminate, and are reported as such rather than read.
+template <class T>
+T* constructed_uninit(T* p) {
+    detail::constructed_uninit(raw(p));
     return p;
 }
 
@@ -229,24 +345,34 @@ struct Scope {
 
 // Variable declarations. `x` is taken by reference and never copied or modified.
 template <class T>
-void local(T& x, const char* name, const Site& site) {
-    detail::declare(detail::VarKind::Local, name, type_id<T>(), raw(std::addressof(x)), sizeof(T), false, site);
+void local(T& x, const char* name, const Site& site, const LayoutRef& layout = LayoutRef{}) {
+    detail::declare(detail::VarKind::Local, name, type_id<T>(layout), raw(std::addressof(x)), sizeof(T), false, site);
 }
 template <class T>
-void local_uninit(T& x, const char* name, const Site& site) {
-    detail::declare(detail::VarKind::Local, name, type_id<T>(), raw(std::addressof(x)), sizeof(T), true, site);
+void local_uninit(T& x, const char* name, const Site& site, const LayoutRef& layout = LayoutRef{}) {
+    detail::declare(detail::VarKind::Local, name, type_id<T>(layout), raw(std::addressof(x)), sizeof(T), true, site);
 }
 template <class T>
-void param(T& x, const char* name, const Site& site) {
-    detail::declare(detail::VarKind::Parameter, name, type_id<T>(), raw(std::addressof(x)), sizeof(T), false, site);
+void param(T& x, const char* name, const Site& site, const LayoutRef& layout = LayoutRef{}) {
+    detail::declare(detail::VarKind::Parameter, name, type_id<T>(layout), raw(std::addressof(x)), sizeof(T), false, site);
+}
+// The referent's type is described first (with its layout, if any): the reference type
+// is built from it.
+template <class T>
+void local_ref(T& x, const char* name, const Site& site, const LayoutRef& layout = LayoutRef{}) {
+    TypeId referent = type_id<T>(layout);
+    detail::declare_reference(detail::VarKind::Local, name, type_id<T&>(), referent, raw(std::addressof(x)), site);
 }
 template <class T>
-void local_ref(T& x, const char* name, const Site& site) {
-    detail::declare_reference(detail::VarKind::Local, name, type_id<T&>(), type_id<T>(), raw(std::addressof(x)), site);
+void param_ref(T& x, const char* name, const Site& site, const LayoutRef& layout = LayoutRef{}) {
+    TypeId referent = type_id<T>(layout);
+    detail::declare_reference(detail::VarKind::Parameter, name, type_id<T&>(), referent, raw(std::addressof(x)), site);
 }
-template <class T>
-void param_ref(T& x, const char* name, const Site& site) {
-    detail::declare_reference(detail::VarKind::Parameter, name, type_id<T&>(), type_id<T>(), raw(std::addressof(x)), site);
+
+// After a statement: report whatever changed in memory the program owns that its own
+// instrumented code did not already report (calls into library code, constructors...).
+inline void sync(const Site& site) {
+    detail::sync(site);
 }
 
 // Wraps a postfix `x++` / `x--` (whose value is the *old* value): both arguments
@@ -271,3 +397,5 @@ T& written(T* p, const Site& site) {
 // replacement of the global one: only tagged allocations become tracked objects.
 void* operator new(std::size_t size, const lattice::rt::NewTag& tag);
 void operator delete(void* p, const lattice::rt::NewTag& tag) noexcept;
+void* operator new[](std::size_t size, const lattice::rt::NewTag& tag);
+void operator delete[](void* p, const lattice::rt::NewTag& tag) noexcept;

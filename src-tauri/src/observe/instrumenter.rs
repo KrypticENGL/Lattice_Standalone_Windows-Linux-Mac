@@ -5,14 +5,14 @@
 //! program's events to come back as a URR [`Timeline`]: live over a named pipe
 //! while the program runs, or from a file afterwards.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tracing::{info, warn};
 
-use super::analysis::analyze;
+use super::analysis::{analyze_project, norm_path, Analysis};
 use super::discovery::analysis_args;
 use super::libclang::Clang;
 use super::pipe::PipeServer;
@@ -52,6 +52,8 @@ impl Default for Transport {
 #[derive(Debug, Clone, Default)]
 pub struct InstrumentationSummary {
     pub files: usize,
+    /// Project headers instrumented (in addition to `files`, the translation units).
+    pub headers: usize,
     pub records: usize,
     pub news: usize,
     pub deletes: usize,
@@ -133,6 +135,34 @@ impl ObservingInstrumenter {
     }
 }
 
+/// The project's own headers in the workspace: [`norm_path`] -> (path, text).
+fn project_headers(dir: &Path) -> Result<HashMap<String, (PathBuf, String)>, String> {
+    let mut out = HashMap::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        let is_header = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| ["h", "hpp", "hh"].iter().any(|x| x.eq_ignore_ascii_case(e)));
+        if is_header {
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            out.insert(norm_path(&path.to_string_lossy()), (path, text));
+        }
+    }
+    Ok(out)
+}
+
+fn tally(summary: &mut InstrumentationSummary, a: &Analysis) {
+    summary.records += a.records.len();
+    summary.news += a.news.len();
+    summary.deletes += a.deletes.len();
+    summary.assigns += a.assigns.len() + a.postfixes.len();
+    summary.functions += a.functions.len();
+    summary.locals += a.locals.iter().map(|l| l.vars.len()).sum::<usize>()
+        + a.fors.iter().map(|f| f.vars.len()).sum::<usize>()
+        + a.range_fors.len();
+}
+
 fn translation_units(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| e.to_string())?
@@ -154,10 +184,16 @@ impl Instrumenter for ObservingInstrumenter {
         let mut summary = InstrumentationSummary::default();
         let mut rewritten: Vec<(PathBuf, String)> = Vec::new();
 
+        let headers = project_headers(&ws.source_dir)?;
+        let header_text: HashMap<String, String> = headers.iter().map(|(k, (_, t))| (k.clone(), t.clone())).collect();
+        // A header included by several units is rewritten once: the first analysis wins.
+        let mut headers_done: HashSet<String> = HashSet::new();
+
         for path in translation_units(&ws.source_dir)? {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
             let source = std::fs::read_to_string(&path).map_err(|e| format!("{name}: {e}"))?;
-            let a = analyze(&clang, &path, &source, &self.args)?;
+            let project = analyze_project(&clang, &path, &source, &self.args, &header_text)?;
+            let a = project.main;
             if let Some(first) = a.errors.first() {
                 // Do not instrument a program that does not compile: the real
                 // compiler will report the user's error in its own words.
@@ -170,15 +206,18 @@ impl Instrumenter for ObservingInstrumenter {
                 return Ok(BuildPlan::default());
             }
             summary.files += 1;
-            summary.records += a.records.len();
-            summary.news += a.news.len();
-            summary.deletes += a.deletes.len();
-            summary.assigns += a.assigns.len() + a.postfixes.len();
-            summary.functions += a.functions.len();
-            summary.locals += a.locals.iter().map(|l| l.vars.len()).sum::<usize>()
-                + a.fors.iter().map(|f| f.vars.len()).sum::<usize>()
-                + a.range_fors.len();
+            tally(&mut summary, &a);
             rewritten.push((path, instrument(&source, &name, &a)));
+            for (key, ha) in project.headers {
+                if !headers_done.insert(key.clone()) {
+                    continue;
+                }
+                let Some((hpath, htext)) = headers.get(&key) else { continue };
+                let hname = hpath.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                summary.headers += 1;
+                tally(&mut summary, &ha);
+                rewritten.push((hpath.clone(), instrument(htext, hname, &ha)));
+            }
         }
         info!(?summary, libclang = %clang.version, "instrumentation planned");
 

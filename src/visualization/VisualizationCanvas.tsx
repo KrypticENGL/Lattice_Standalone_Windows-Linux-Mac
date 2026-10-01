@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Recording } from "../runtime/useRecording";
 import { layoutGraph, metricsFor, type BoxLayout, type EdgeLayout, type Layout, type Metrics } from "./layout";
+import { buildInspector } from "./inspector";
+import { InspectorPanel } from "./InspectorPanel";
+import { boxIsSelected, entityForBox, focusObjects, type SelectedRuntimeEntity } from "./selection";
+import type { Inspector } from "./useInspector";
 
 /** Width of one character of the monospace UI font, measured once the font is available. */
 function useCharWidth(): number {
@@ -23,6 +27,8 @@ function useCharWidth(): number {
 
 interface Props {
   recording: Recording | null;
+  /** The selection shared with `useRecording` (its `focus`); the canvas only reads and updates it. */
+  inspector: Inspector;
 }
 
 /**
@@ -30,11 +36,17 @@ interface Props {
  * heap objects to the right, pointers as arrows. It draws whatever the recording
  * contains; nothing here knows what data structure the program is building.
  */
-export function VisualizationCanvas({ recording: r }: Props) {
+export function VisualizationCanvas({ recording: r, inspector }: Props) {
   const charW = useCharWidth();
   const metrics = useMemo(() => metricsFor(charW), [charW]);
   const graph = r?.graph ?? null;
   const layout = useMemo(() => (graph ? layoutGraph(graph, metrics) : null), [graph, metrics]);
+  // The inspector is the same snapshot, looked at through the selection: it is recomputed
+  // whenever the step (and so `graph`) changes, which is all the synchronization it needs.
+  const model = useMemo(() => (graph ? buildInspector(graph, inspector.trail) : null), [graph, inspector.trail]);
+  const wanted = inspector.focus.join(",");
+  const loading = r !== null && (r.graphFocus !== wanted || focusObjects(inspector.trail).join(",") !== wanted);
+  const current = inspector.trail[inspector.trail.length - 1];
   const scroller = useRef<HTMLDivElement | null>(null);
 
   // Keep the action in view: bring what changed at this step (else the executing
@@ -71,11 +83,12 @@ export function VisualizationCanvas({ recording: r }: Props) {
   }
 
   const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "ArrowRight") r.setStep(r.step + 1);
-    else if (e.key === "ArrowLeft") r.setStep(r.step - 1);
+    if (e.key === "ArrowRight") r.next();
+    else if (e.key === "ArrowLeft") r.prev();
     else if (e.key === "Home") r.setStep(0);
     else if (e.key === "End") r.setStep(r.total);
     else if (e.key === " ") r.playing ? r.pause() : r.play();
+    else if (e.key === "Escape" && inspector.trail.length > 0) inspector.close();
     else return;
     e.preventDefault();
   };
@@ -91,17 +104,22 @@ export function VisualizationCanvas({ recording: r }: Props) {
       )}
       {graph?.truncatedHere && <div className="viz-note viz-warn">The recording ends at this step.</div>}
       {r.error && <div className="viz-note viz-error">{r.error}</div>}
-      <div className="viz-scroll" ref={scroller}>
-        {layout && graph ? (
-          <Scene layout={layout} metrics={metrics} />
-        ) : (
-          <div className="viz-placeholder">Loading…</div>
-        )}
-        {graph && graph.objectsOmitted > 0 && (
-          <div className="viz-note">{graph.objectsOmitted} more objects exist but are not drawn.</div>
-        )}
-        {layout && layout.unplaced > 0 && (
-          <div className="viz-note">{layout.unplaced} pointer(s) lead to objects that are not drawn.</div>
+      <div className="viz-main">
+        <div className="viz-scroll" ref={scroller}>
+          {layout && graph ? (
+            <Scene layout={layout} metrics={metrics} current={current} onSelect={inspector.open} />
+          ) : (
+            <div className="viz-placeholder">Loading…</div>
+          )}
+          {graph && graph.objectsOmitted > 0 && (
+            <div className="viz-note">{graph.objectsOmitted} more objects exist but are not drawn.</div>
+          )}
+          {layout && layout.unplaced > 0 && (
+            <div className="viz-note">{layout.unplaced} pointer(s) lead to objects that are not drawn.</div>
+          )}
+        </div>
+        {model && (
+          <InspectorPanel model={model} loading={loading} onDrill={inspector.drill} onGoto={inspector.goto} onClose={inspector.close} />
         )}
       </div>
     </div>
@@ -115,7 +133,7 @@ function Controls({ r }: { r: Recording }) {
       <button className="btn btn-icon" onClick={() => r.setStep(0)} disabled={r.step === 0} title="Start (Home)" aria-label="Start">
         ⏮
       </button>
-      <button className="btn btn-icon" onClick={() => r.setStep(r.step - 1)} disabled={r.step === 0} title="Previous event (←)" aria-label="Previous event">
+      <button className="btn btn-icon" onClick={r.prev} disabled={r.step === 0} title="Previous step (←)" aria-label="Previous step">
         ◀
       </button>
       <button
@@ -126,7 +144,7 @@ function Controls({ r }: { r: Recording }) {
       >
         {r.playing ? "⏸" : "▷"}
       </button>
-      <button className="btn btn-icon" onClick={() => r.setStep(r.step + 1)} disabled={r.step >= r.total} title="Next event (→)" aria-label="Next event">
+      <button className="btn btn-icon" onClick={r.next} disabled={r.step >= r.total} title="Next step (→)" aria-label="Next step">
         ▶
       </button>
       <button className="btn btn-icon" onClick={() => r.setStep(r.total)} disabled={r.step >= r.total} title="End (End)" aria-label="End">
@@ -136,22 +154,29 @@ function Controls({ r }: { r: Recording }) {
         className="viz-slider"
         type="range"
         min={0}
-        max={r.total}
-        value={r.step}
-        onChange={(e) => r.setStep(Number(e.target.value))}
+        max={r.userTotal}
+        value={r.userStep}
+        onChange={(e) => r.setUserStep(Number(e.target.value))}
         aria-label="Position in the run"
       />
       <span className="viz-position">
-        {r.step.toLocaleString()} / {r.total.toLocaleString()}
+        {r.userStep.toLocaleString()} / {r.userTotal.toLocaleString()}
       </span>
-      <span className="viz-event" title={g?.event ?? ""}>
-        {g?.event ?? (r.step === 0 ? "before the program ran" : "")}
+      <span className="viz-event" title={r.current ? `${r.current.events} runtime events` : (g?.event ?? "")}>
+        {r.current?.label ?? g?.event ?? (r.step === 0 ? "before the program ran" : "")}
       </span>
     </div>
   );
 }
 
-function Scene({ layout, metrics: m }: { layout: Layout; metrics: Metrics }) {
+interface SceneProps {
+  layout: Layout;
+  metrics: Metrics;
+  current: SelectedRuntimeEntity | undefined;
+  onSelect: (e: SelectedRuntimeEntity) => void;
+}
+
+function Scene({ layout, metrics: m, current, onSelect }: SceneProps) {
   return (
     <svg
       className="viz-svg"
@@ -169,7 +194,7 @@ function Scene({ layout, metrics: m }: { layout: Layout; metrics: Metrics }) {
         ))}
       </defs>
       {layout.boxes.map((b) => (
-        <Box key={b.key} b={b} m={m} />
+        <Box key={b.key} b={b} m={m} selected={boxIsSelected(b, current)} onSelect={onSelect} />
       ))}
       {layout.edges.map((e) => (
         <Edge key={e.id} e={e} />
@@ -189,16 +214,39 @@ function Edge({ e }: { e: EdgeLayout }) {
   );
 }
 
-function Box({ b, m }: { b: BoxLayout; m: Metrics }) {
+function Box({ b, m, selected, onSelect }: { b: BoxLayout; m: Metrics; selected: boolean; onSelect: (e: SelectedRuntimeEntity) => void }) {
+  const entity = entityForBox(b);
   const cls = [
     "box",
     `box-${b.kind}`,
     b.state ? `state-${b.state}` : "",
     b.current ? "current" : "",
     b.changed ? "changed" : "",
+    entity ? "inspectable" : "",
+    selected ? "selected" : "",
   ].join(" ");
+  const activate = entity ? () => onSelect(entity) : undefined;
   return (
-    <g className={cls} style={{ transform: `translate(${b.x}px, ${b.y}px)` }}>
+    <g
+      className={cls}
+      style={{ transform: `translate(${b.x}px, ${b.y}px)` }}
+      onClick={activate}
+      onKeyDown={
+        activate
+          ? (e) => {
+              if (e.key === "Enter") {
+                activate();
+                e.stopPropagation();
+              }
+            }
+          : undefined
+      }
+      role={entity ? "button" : undefined}
+      tabIndex={entity ? 0 : undefined}
+      aria-label={entity ? `Inspect ${b.title}${b.subtitle ? `, ${b.subtitle}` : ""}` : undefined}
+      aria-pressed={entity ? selected : undefined}
+      data-testid={entity ? `box-${b.key}` : undefined}
+    >
       <rect className="box-body" width={b.w} height={b.h} rx={6} />
       <text className="box-title" x={m.padX} y={m.headerH / 2 + 4}>
         {b.title}

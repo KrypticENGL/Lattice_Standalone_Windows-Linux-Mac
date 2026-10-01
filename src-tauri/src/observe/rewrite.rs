@@ -10,11 +10,13 @@
 //! ```text
 //! new Node{10, nullptr}
 //!   -> ::lattice::rt::constructed(new (::lattice::rt::tag<Node>(SITE)) Node{10, nullptr})
+//! new int[n]
+//!   -> ::lattice::rt::constructed_uninit(new (::lattice::rt::tag_array<int>(SITE)) int[n])
 //! a->next = b            (also +=, -=, ..., and prefix ++/--)
 //!   -> ::lattice::rt::written(&(a->next = b), SITE)
 //! i++
 //!   -> ::lattice::rt::post_written(i++, &(i), SITE)
-//! delete b
+//! delete b                (and `delete[] b` -> delete[] ::lattice::rt::del_hint( b, SITE))
 //!   -> delete ::lattice::rt::del_hint( b, SITE)
 //! struct Node {...};
 //!   -> struct Node {...}; <descriptor function for Node>
@@ -27,8 +29,9 @@
 
 use super::analysis::{
     Analysis, AssignSite, BlockSite, DeleteSite, ForSite, FunctionSite, HookKind, LocalSite, NewSite,
-    PostfixSite, RangeForSite, RecordSite, VarHook,
+    PostfixSite, RangeForSite, RecordSite, SyncSite, VarHook,
 };
+use super::layout::{Layout, NodeKind};
 
 struct Insertion {
     pos: usize,
@@ -46,6 +49,8 @@ const KEY_FRAME: i64 = i64::MIN;
 const KEY_SCOPE: i64 = i64::MIN + 1;
 const KEY_BODY_HOOK: i64 = i64::MIN + 2;
 const KEY_LOCAL: i64 = i64::MIN + 3;
+// After a statement's own hooks (a declaration's `local(...)`), so the comparison sees them.
+const KEY_SYNC: i64 = i64::MIN + 4;
 
 fn cpp_string(s: &str) -> String {
     let mut o = String::from("\"");
@@ -65,7 +70,67 @@ fn site(file: &str, line: u32, column: u32, function: &str) -> String {
     format!("::lattice::rt::Site{{{},{line},{column},{}}}", cpp_string(file), cpp_string(function))
 }
 
-fn descriptor(r: &RecordSite) -> String {
+/// A C++ expression of type `LayoutRef` carrying the layout, with everything it needs
+/// inside it (a lambda holding the tables as local statics), so that it can sit in any
+/// expression, in any scope, in a header or a source file, with no declaration to order
+/// or guard. Project types the layout refers to are named in `lay<...>`, where they are
+/// in scope.
+fn layout_expr(l: &Layout) -> String {
+    let mut s = String::from("[]() { ");
+    for (i, n) in l.nodes.iter().enumerate() {
+        if n.kind == NodeKind::Record && !n.fields.is_empty() {
+            s.push_str(&format!("static const ::lattice::rt::LField f{i}[] = {{"));
+            for (j, f) in n.fields.iter().enumerate() {
+                if j > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!("{{{}, {}u, {}u}}", cpp_string(&f.name), f.offset, f.ty));
+            }
+            s.push_str("}; ");
+        }
+    }
+    s.push_str("static const ::lattice::rt::LNode n[] = {");
+    for (i, n) in l.nodes.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let kind = match n.kind {
+            NodeKind::Prim => "Prim",
+            NodeKind::Enum => "Enum",
+            NodeKind::Pointer => "Pointer",
+            NodeKind::Array => "Array",
+            NodeKind::Record => "Record",
+            NodeKind::Opaque => "Opaque",
+            NodeKind::External => "External",
+        };
+        let count = if n.kind == NodeKind::Record { n.fields.len() as u64 } else { n.count };
+        let fields = if n.kind == NodeKind::Record && !n.fields.is_empty() { format!("f{i}") } else { "nullptr".into() };
+        s.push_str(&format!(
+            "{{::lattice::rt::LKind::{kind}, ::lattice::rt::Prim::{}, {}, {}u, {}, {}u, {}u, {}}}",
+            n.prim,
+            n.signed,
+            n.size,
+            cpp_string(&n.name),
+            n.reference,
+            count,
+            fields
+        ));
+    }
+    s.push_str(&format!(
+        "}}; static const ::lattice::rt::Layout l = {{n, {}u, {}u}}; return ::lattice::rt::lay<{}>(l); }}()",
+        l.nodes.len(),
+        l.root,
+        l.externals.join(", ")
+    ));
+    s
+}
+
+/// `, LAYOUT` for a hook or tag that has one, else nothing.
+fn layout_arg(layouts: &[Layout], index: Option<usize>) -> String {
+    index.and_then(|i| layouts.get(i)).map(|l| format!(", {}", layout_expr(l))).unwrap_or_default()
+}
+
+fn descriptor(r: &RecordSite, layouts: &[Layout]) -> String {
     let n = &r.name;
     let mut s = String::new();
     s.push_str(" LATTICE_DIAG_PUSH");
@@ -79,8 +144,10 @@ fn descriptor(r: &RecordSite) -> String {
             if i > 0 {
                 s.push(',');
             }
+            let lay = layout_arg(layouts, r.field_layouts.get(i).copied().flatten());
+            let lay = lay.strip_prefix(", ").unwrap_or("");
             s.push_str(&format!(
-                "{{{}, ::lattice::rt::type_id<decltype({n}::{f})>(), offsetof({n}, {f})}}",
+                "{{{}, ::lattice::rt::type_id<decltype({n}::{f})>({lay}), offsetof({n}, {f})}}",
                 cpp_string(f)
             ));
         }
@@ -96,14 +163,16 @@ fn push_span(out: &mut Vec<Insertion>, start: usize, end: usize, open: String, c
     out.push(Insertion { pos: end, group: 0, key: -(start as i64), text: close });
 }
 
-fn new_edits(out: &mut Vec<Insertion>, file: &str, n: &NewSite) {
+fn new_edits(out: &mut Vec<Insertion>, file: &str, n: &NewSite, layouts: &[Layout]) {
     let s = site(file, n.line, n.column, &n.function);
-    push_span(out, n.start, n.end, "::lattice::rt::constructed(".into(), ")".into());
+    let wrap = if n.uninit { "::lattice::rt::constructed_uninit(" } else { "::lattice::rt::constructed(" };
+    push_span(out, n.start, n.end, wrap.into(), ")".into());
+    let tag = if n.array { "tag_array" } else { "tag" };
     out.push(Insertion {
         pos: n.kw_end,
         group: 1,
         key: 0,
-        text: format!(" (::lattice::rt::tag<{}>({s}))", n.ty),
+        text: format!(" (::lattice::rt::{tag}<{}>({s}{}))", n.ty, layout_arg(layouts, n.layout)),
     });
 }
 
@@ -131,7 +200,7 @@ fn postfix_edits(out: &mut Vec<Insertion>, source: &str, file: &str, p: &Postfix
 }
 
 /// `::lattice::rt::local(x, "x", SITE)` (a call, no trailing `;`).
-fn hook_call(v: &VarHook, site: &str, parameter: bool) -> String {
+fn hook_call(v: &VarHook, site: &str, parameter: bool, layouts: &[Layout]) -> String {
     let f = match (v.kind, parameter) {
         (HookKind::Value, false) => "local",
         (HookKind::Uninit, false) => "local_uninit",
@@ -139,18 +208,18 @@ fn hook_call(v: &VarHook, site: &str, parameter: bool) -> String {
         (HookKind::Value | HookKind::Uninit, true) => "param",
         (HookKind::Ref, true) => "param_ref",
     };
-    format!("::lattice::rt::{f}({0}, {1}, {site})", v.name, cpp_string(&v.name))
+    format!("::lattice::rt::{f}({0}, {1}, {site}{2})", v.name, cpp_string(&v.name), layout_arg(layouts, v.layout))
 }
 
 /// One hook statement per variable.
-fn hooks(vars: &[VarHook], site: &str, parameter: bool) -> String {
-    vars.iter().map(|v| format!(" {};", hook_call(v, site, parameter))).collect()
+fn hooks(vars: &[VarHook], site: &str, parameter: bool, layouts: &[Layout]) -> String {
+    vars.iter().map(|v| format!(" {};", hook_call(v, site, parameter, layouts))).collect()
 }
 
-fn function_edits(out: &mut Vec<Insertion>, file: &str, f: &FunctionSite) {
+fn function_edits(out: &mut Vec<Insertion>, file: &str, f: &FunctionSite, layouts: &[Layout]) {
     let s = site(file, f.line, f.column, &f.name);
     let mut text = format!(" ::lattice::rt::Frame __lattice_frame({s}, {});", cpp_string(&f.name));
-    text.push_str(&hooks(&f.params, &s, true));
+    text.push_str(&hooks(&f.params, &s, true, layouts));
     out.push(Insertion { pos: f.open, group: 1, key: KEY_FRAME, text });
 }
 
@@ -164,12 +233,12 @@ fn block_edits(out: &mut Vec<Insertion>, file: &str, b: &BlockSite) {
     });
 }
 
-fn local_edits(out: &mut Vec<Insertion>, file: &str, l: &LocalSite) {
+fn local_edits(out: &mut Vec<Insertion>, file: &str, l: &LocalSite, layouts: &[Layout]) {
     let s = site(file, l.line, l.column, &l.function);
-    out.push(Insertion { pos: l.insert_at, group: 1, key: KEY_LOCAL, text: hooks(&l.vars, &s, false) });
+    out.push(Insertion { pos: l.insert_at, group: 1, key: KEY_LOCAL, text: hooks(&l.vars, &s, false, layouts) });
 }
 
-fn for_edits(out: &mut Vec<Insertion>, file: &str, f: &ForSite) {
+fn for_edits(out: &mut Vec<Insertion>, file: &str, f: &ForSite, layouts: &[Layout]) {
     let s = site(file, f.line, f.column, &f.function);
     // The loop variables get a scope of their own: the whole `for` goes in a block.
     push_span(
@@ -180,18 +249,23 @@ fn for_edits(out: &mut Vec<Insertion>, file: &str, f: &ForSite) {
         " }".into(),
     );
     // Reported from the condition: `(void, cond)` has the condition's value.
-    let calls: Vec<String> = f.vars.iter().map(|v| hook_call(v, &s, false)).collect();
+    let calls: Vec<String> = f.vars.iter().map(|v| hook_call(v, &s, false, layouts)).collect();
     push_span(out, f.cond_start, f.cond_end, format!("({}, ", calls.join(", ")), ")".into());
 }
 
-fn range_for_edits(out: &mut Vec<Insertion>, file: &str, r: &RangeForSite) {
+fn range_for_edits(out: &mut Vec<Insertion>, file: &str, r: &RangeForSite, layouts: &[Layout]) {
     let s = site(file, r.line, r.column, &r.function);
     out.push(Insertion {
         pos: r.body_open,
         group: 1,
         key: KEY_BODY_HOOK,
-        text: hooks(std::slice::from_ref(&r.var), &s, false),
+        text: hooks(std::slice::from_ref(&r.var), &s, false, layouts),
     });
+}
+
+fn sync_edits(out: &mut Vec<Insertion>, file: &str, y: &SyncSite) {
+    let s = site(file, y.line, y.column, &y.function);
+    out.push(Insertion { pos: y.insert_at, group: 1, key: KEY_SYNC, text: format!(" ::lattice::rt::sync({s});") });
 }
 
 /// Apply the instrumentation described by `analysis` to `source`.
@@ -199,10 +273,10 @@ fn range_for_edits(out: &mut Vec<Insertion>, file: &str, r: &RangeForSite) {
 pub fn instrument(source: &str, file: &str, analysis: &Analysis) -> String {
     let mut ins: Vec<Insertion> = Vec::new();
     for r in &analysis.records {
-        ins.push(Insertion { pos: r.insert_at, group: 1, key: 0, text: descriptor(r) });
+        ins.push(Insertion { pos: r.insert_at, group: 1, key: 0, text: descriptor(r, &analysis.layouts) });
     }
     for n in &analysis.news {
-        new_edits(&mut ins, file, n);
+        new_edits(&mut ins, file, n, &analysis.layouts);
     }
     for d in &analysis.deletes {
         delete_edits(&mut ins, file, d);
@@ -214,19 +288,22 @@ pub fn instrument(source: &str, file: &str, analysis: &Analysis) -> String {
         postfix_edits(&mut ins, source, file, p);
     }
     for f in &analysis.functions {
-        function_edits(&mut ins, file, f);
+        function_edits(&mut ins, file, f, &analysis.layouts);
     }
     for b in &analysis.blocks {
         block_edits(&mut ins, file, b);
     }
     for l in &analysis.locals {
-        local_edits(&mut ins, file, l);
+        local_edits(&mut ins, file, l, &analysis.layouts);
     }
     for f in &analysis.fors {
-        for_edits(&mut ins, file, f);
+        for_edits(&mut ins, file, f, &analysis.layouts);
     }
     for r in &analysis.range_fors {
-        range_for_edits(&mut ins, file, r);
+        range_for_edits(&mut ins, file, r, &analysis.layouts);
+    }
+    for y in &analysis.syncs {
+        sync_edits(&mut ins, file, y);
     }
     ins.retain(|i| i.pos <= source.len() && source.is_char_boundary(i.pos));
     ins.sort_by(|a, b| (a.pos, a.group, a.key).cmp(&(b.pos, b.group, b.key)));
@@ -267,7 +344,7 @@ mod tests {
     fn rewriting_never_changes_the_line_count() {
         let src = "struct N { int v; };\nint main() {\n  N* p = new N{1};\n  p->v = 2;\n  delete p;\n}\n";
         let an = Analysis {
-            records: vec![RecordSite { name: "N".into(), fields: vec!["v".into()], insert_at: 20 }],
+            records: vec![RecordSite { name: "N".into(), fields: vec!["v".into()], insert_at: 20, field_layouts: vec![None] }],
             news: vec![NewSite {
                 start: src.find("new N").unwrap(),
                 end: src.find("new N").unwrap() + 8,
@@ -276,6 +353,9 @@ mod tests {
                 column: 10,
                 function: "main".into(),
                 ty: "N".into(),
+                array: false,
+                uninit: false,
+                layout: None,
             }],
             deletes: vec![DeleteSite {
                 start: src.find("delete").unwrap(),
@@ -351,7 +431,7 @@ mod tests {
                 line: 1,
                 column: 1,
                 function: "f".into(),
-                vars: vec![VarHook { name: "i".into(), kind: HookKind::Value }],
+                vars: vec![VarHook { name: "i".into(), kind: HookKind::Value, layout: None }],
             }],
             ..Analysis::default()
         };
@@ -360,6 +440,62 @@ mod tests {
         assert!(out.contains("(::lattice::rt::local(i, \"i\", "), "{out}");
         assert!(out.contains(" i < 3)"), "{out}");
         assert!(out.ends_with(" }"), "{out}");
+        assert_eq!(out.lines().count(), 1);
+    }
+
+    fn sample_layout() -> Layout {
+        use crate::observe::layout::{LayoutField, LayoutNode};
+        let int = LayoutNode { kind: NodeKind::Prim, prim: "Int", signed: true, size: 4, name: "int".into(), reference: 0, count: 0, fields: vec![] };
+        let ptr = LayoutNode { kind: NodeKind::Pointer, prim: "Int", signed: false, size: 8, name: "int *".into(), reference: 2, count: 0, fields: vec![] };
+        let rec = LayoutNode {
+            kind: NodeKind::Record,
+            prim: "Int",
+            signed: false,
+            size: 8,
+            name: "std::thing<\"q\">".into(),
+            reference: 0,
+            count: 0,
+            fields: vec![LayoutField { name: "first".into(), offset: 0, ty: 1 }],
+        };
+        Layout { nodes: vec![rec, ptr, int], root: 0, externals: vec!["Node".into()] }
+    }
+
+    #[test]
+    fn a_layout_is_one_self_contained_line() {
+        let text = layout_expr(&sample_layout());
+        assert!(!text.contains('\n'), "{text}");
+        assert!(text.starts_with("[]() { static const ::lattice::rt::LField f0[]"), "{text}");
+        assert!(text.contains("::lattice::rt::LKind::Record"), "{text}");
+        assert!(text.contains("\"std::thing<\\\"q\\\">\""), "names are escaped: {text}");
+        assert!(text.ends_with("return ::lattice::rt::lay<Node>(l); }()"), "{text}");
+        assert_eq!(text.matches('{').count(), text.matches('}').count());
+    }
+
+    #[test]
+    fn a_hook_with_a_layout_passes_it_and_one_without_is_unchanged() {
+        let l = vec![sample_layout()];
+        let with = VarHook { name: "v".into(), kind: HookKind::Value, layout: Some(0) };
+        let without = VarHook { name: "w".into(), kind: HookKind::Value, layout: None };
+        assert!(hook_call(&with, "SITE", false, &l).starts_with("::lattice::rt::local(v, \"v\", SITE, []() {"));
+        assert_eq!(hook_call(&without, "SITE", false, &l), "::lattice::rt::local(w, \"w\", SITE)");
+    }
+
+    #[test]
+    fn a_sync_follows_the_statement_and_the_hooks_of_a_declaration() {
+        let src = "int x = 1; f();";
+        let an = Analysis {
+            locals: vec![LocalSite { insert_at: 10, line: 1, column: 1, function: "main".into(), vars: vec![VarHook { name: "x".into(), kind: HookKind::Value, layout: None }] }],
+            syncs: vec![
+                SyncSite { insert_at: 10, line: 1, column: 1, function: "main".into() },
+                SyncSite { insert_at: 15, line: 1, column: 12, function: "main".into() },
+            ],
+            ..Analysis::default()
+        };
+        let out = instrument(src, "m.cpp", &an);
+        let local = out.find("::lattice::rt::local(x").unwrap();
+        let first_sync = out.find("::lattice::rt::sync(").unwrap();
+        assert!(local < first_sync, "the declaration is reported before the comparison: {out}");
+        assert!(out.trim_end().ends_with("::lattice::rt::sync(::lattice::rt::Site{\"m.cpp\",1,12,\"main\"});"), "{out}");
         assert_eq!(out.lines().count(), 1);
     }
 }

@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isNative } from "../utils/native";
-import { isActive, onSessionState, runProgram, stopProgram, type RuntimeSession } from "./index";
+import { isActive, onSessionState, runProgram, stopProgram, type RuntimeSession, type SourceFile } from "./index";
 
 /**
  * Owns the "current session" for the UI: starts runs, stops them, and tracks
  * live state changes pushed from the native engine.
  */
-export function useExecution(getSource: () => string, fileName: string, observe: boolean) {
+export function useExecution(getFiles: () => SourceFile[], observe: boolean, getSolution: () => { name: string; path: string | null }) {
   const [session, setSession] = useState<RuntimeSession | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
@@ -38,7 +38,8 @@ export function useExecution(getSource: () => string, fileName: string, observe:
     setSession(null);
     currentId.current = null;
     try {
-      const final = await runProgram("Untitled", [{ name: fileName, contents: getSource() }], observe);
+      const sln = getSolution();
+      const final = await runProgram(sln.name, getFiles(), observe, sln.path);
       setSession(final);
     } catch (err) {
       setLocalError(String(err));
@@ -46,11 +47,18 @@ export function useExecution(getSource: () => string, fileName: string, observe:
       currentId.current = null;
       setPending(false);
     }
-  }, [getSource, fileName, observe]);
+  }, [getFiles, observe, getSolution]);
 
   const stop = useCallback(() => {
     if (session && isActive(session.state)) void stopProgram(session.id);
   }, [session]);
 
-  return { session, localError, running: pending || isActive(session?.state), run, stop };
+  /** Make `s` the current session (e.g. a recording loaded from a .lattice file), or clear it. */
+  const adopt = useCallback((s: RuntimeSession | null) => {
+    currentId.current = null;
+    setLocalError(null);
+    setSession(s);
+  }, []);
+
+  return { adopt, session, localError, running: pending || isActive(session?.state), run, stop };
 }

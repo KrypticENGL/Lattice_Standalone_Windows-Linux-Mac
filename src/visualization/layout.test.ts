@@ -1,40 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { GraphView, ObjectView, SlotView, VariableView, FrameView } from "../runtime";
 import { layoutGraph, metricsFor, sampleEdge, type BoxLayout } from "./layout";
+import type { SlotView, VariableView } from "../runtime";
+import { agg, frame, graph, node, obj, ptr, scalar, variable } from "./fixtures";
 
 const m = metricsFor(7);
 
-// ---- fixtures ---------------------------------------------------------------
+// ---- fixtures (shared builders live in ./fixtures) -----------------------------------
 
-const scalar = (name: string | null, ty: string, text: string): SlotView => ({ name, ty, value: { kind: "scalar", text } });
-const ptr = (name: string | null, object: number | null, path = "", dangling = false, kind: "object" | "null" | "unresolved" = "object"): SlotView => ({
-  name,
-  ty: "Node*",
-  value: { kind: "pointer", reference: false, target: { kind: object === null ? (kind === "object" ? "null" : kind) : kind, object, path, dangling } },
-});
-const agg = (ty: string, fields: SlotView[], name: string | null = null): SlotView => ({ name, ty, value: { kind: "aggregate", fields } });
-const node = (id: number, value: number, next: SlotView, state: ObjectView["state"] = "alive"): ObjectView => ({
-  id,
-  state,
-  storage: "heap",
-  address: null,
-  slot: agg("Node", [scalar("value", "int", String(value)), next]),
-});
-const variable = (name: string, object: number, slot: SlotView): VariableView => ({ name, inBlock: false, object, slot });
-const frame = (id: number, fn: string, variables: VariableView[]): FrameView => ({ id, function: fn, line: 3, variables });
-const graph = (p: Partial<GraphView>): GraphView => ({
-  step: 1,
-  total: 1,
-  truncatedHere: false,
-  event: null,
-  line: null,
-  changed: [],
-  threads: [],
-  globals: [],
-  objects: [],
-  objectsOmitted: 0,
-  ...p,
-});
 const head = (target: number) => variable("head", 1, ptr(null, target));
 const mainWith = (...vars: VariableView[]) => [{ id: 0, frames: [frame(1, "main", vars)] }];
 const box = (l: ReturnType<typeof layoutGraph>, key: string): BoxLayout => l.boxes.find((b) => b.key === key)!;
@@ -79,7 +51,7 @@ describe("layout", () => {
     const g = graph({
       threads: mainWith(head(10)),
       objects: [
-        { id: 10, state: "alive", storage: "heap", address: null, slot: agg("Tree", [scalar("v", "int", "1"), ptr("left", 11), ptr("right", 12)]) },
+        obj(10, agg("Tree", [scalar("v", "int", "1"), ptr("left", 11), ptr("right", 12)])),
         node(11, 2, ptr("next", null)),
         node(12, 3, ptr("next", null)),
       ],
@@ -234,7 +206,7 @@ describe("layout", () => {
     };
     const g = graph({
       threads: mainWith(variable("q", 1, ptr(null, 30, "[1]"))),
-      objects: [{ id: 30, state: "alive", storage: "heap", address: null, slot: arr }],
+      objects: [obj(30, arr)],
     });
     const l = layoutGraph(g, m);
     const b = box(l, "object:30");
@@ -247,7 +219,7 @@ describe("layout", () => {
     const inner = agg("Inner", [scalar("a", "int", "1"), scalar("b", "int", "2")], "in");
     const g = graph({
       threads: mainWith(variable("p", 1, ptr(null, 40, ".0.1"))),
-      objects: [{ id: 40, state: "alive", storage: "heap", address: null, slot: agg("Outer", [inner, ptr("p", null)]) }],
+      objects: [obj(40, agg("Outer", [inner, ptr("p", null)]))],
     });
     const l = layoutGraph(g, m);
     const b = box(l, "object:40");

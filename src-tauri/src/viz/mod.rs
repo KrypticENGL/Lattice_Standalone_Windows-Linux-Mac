@@ -22,8 +22,8 @@ use std::collections::HashSet;
 use serde::Serialize;
 
 use crate::model::{
-    EventKind, LifeState, Object, ObjectId, RuntimeEvent, RuntimeState, Step, StorageClass, Target,
-    TargetStatus, TypeId, TypeKind, Unavailable, Value,
+    EndReason, EventKind, LifeState, Object, ObjectId, RuntimeEvent, RuntimeState, Step, StorageClass,
+    Target, TargetStatus, TypeId, TypeKind, Unavailable, Value, VariableKind,
 };
 
 /// Heap objects shown at once. Beyond this the view says how many it left out.
@@ -52,6 +52,11 @@ pub struct GraphView {
     pub objects: Vec<ObjectView>,
     /// Objects that qualified but did not fit under [`MAX_OBJECTS`].
     pub objects_omitted: u32,
+    /// The objects the caller asked about by id (an inspector's selection), whether or
+    /// not they are otherwise drawn: a freed object nothing points at any more, or the
+    /// storage of a variable, is still described, with its lifetime. Same type as
+    /// `objects`: there is no second description of an object.
+    pub focus: Vec<ObjectView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -66,7 +71,12 @@ pub struct ThreadView {
 #[serde(rename_all = "camelCase")]
 pub struct FrameView {
     pub id: u64,
+    pub thread: u64,
+    /// Position on its thread's stack: 0 is the outermost frame (`main`).
+    pub depth: u32,
     pub function: String,
+    /// Source file this frame last reported being in.
+    pub file: Option<String>,
     /// Where this frame last reported being.
     pub line: Option<u32>,
     /// Parameters and locals in declaration order.
@@ -77,6 +87,8 @@ pub struct FrameView {
 #[serde(rename_all = "camelCase")]
 pub struct VariableView {
     pub name: String,
+    /// `parameter`, `local`, `global` or `staticLocal`.
+    pub kind: &'static str,
     /// Declared in a nested block (not at the function's top level).
     pub in_block: bool,
     /// The storage object the name is bound to: the anchor of this variable.
@@ -93,7 +105,22 @@ pub struct ObjectView {
     /// `heap`, `static`, `automatic`, ...
     pub storage: String,
     pub address: Option<String>,
+    pub lifetime: LifetimeView,
     pub slot: SlotView,
+}
+
+/// When an object's life began and ended, as timeline steps (the numbers the position
+/// slider shows: step N is the state after N events). `ended_step` is the step at which
+/// the end first shows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifetimeView {
+    pub allocated_step: u64,
+    pub ended_step: Option<u64>,
+    /// `freed`, `scopeExit`, `frameExit`, `programExit`, `other`.
+    pub end_reason: Option<&'static str>,
+    /// Source line of the declaration/allocation, if the observer said.
+    pub origin_line: Option<u32>,
 }
 
 /// A named, typed place holding a value.
@@ -272,10 +299,53 @@ fn storage_name(s: StorageClass) -> &'static str {
     }
 }
 
+fn variable_kind(k: VariableKind) -> &'static str {
+    match k {
+        VariableKind::Local => "local",
+        VariableKind::Parameter => "parameter",
+        VariableKind::Global => "global",
+        VariableKind::StaticLocal => "staticLocal",
+    }
+}
+
+fn end_reason_name(r: EndReason) -> &'static str {
+    match r {
+        EndReason::Freed => "freed",
+        EndReason::ScopeExit => "scopeExit",
+        EndReason::FrameExit => "frameExit",
+        EndReason::ProgramExit => "programExit",
+        EndReason::Other => "other",
+    }
+}
+
+fn object_view(state: &RuntimeState, o: &Object) -> ObjectView {
+    ObjectView {
+        id: o.id.0,
+        state: object_state(o),
+        storage: storage_name(o.storage).to_string(),
+        address: o.address.map(|a| format!("0x{a:x}")),
+        // Event seq N is the (N+1)th event, and "the state after N+1 events" is step N+1.
+        lifetime: LifetimeView {
+            allocated_step: o.lifetime.allocated_at.0 + 1,
+            ended_step: o.lifetime.ended_at.map(|e| e.0 + 1),
+            end_reason: o.lifetime.end_reason.map(end_reason_name),
+            origin_line: o.origin.as_ref().map(|l| l.line),
+        },
+        slot: slot(state, None, Some(o.ty), &o.value),
+    }
+}
+
+/// Describe the objects with these ids in `state`, in the order asked, skipping ids that
+/// do not exist (yet). Includes destroyed objects: their last value and their lifetime.
+pub fn object_views(state: &RuntimeState, ids: &[u64]) -> Vec<ObjectView> {
+    ids.iter().filter_map(|id| state.object(ObjectId(*id))).map(|o| object_view(state, o)).collect()
+}
+
 fn variable_view(state: &RuntimeState, v: &crate::model::Variable) -> Option<VariableView> {
     let object = state.object(v.object)?;
     Some(VariableView {
         name: v.name.clone(),
+        kind: variable_kind(v.kind),
         in_block: v.scope.is_some(),
         object: v.object.0,
         slot: slot(state, None, Some(object.ty), &object.value),
@@ -314,7 +384,7 @@ pub fn build(
     let mut threads = Vec::new();
     for thread in state.threads() {
         let mut frames = Vec::new();
-        for fid in state.stack(thread) {
+        for (depth, fid) in state.stack(thread).iter().enumerate() {
             let Some(frame) = state.frame(*fid) else { continue };
             let variables: Vec<VariableView> = state
                 .frame_variables(*fid)
@@ -325,7 +395,10 @@ pub fn build(
                 .collect();
             frames.push(FrameView {
                 id: fid.0,
+                thread: thread.0,
+                depth: depth as u32,
                 function: frame.function.to_string(),
+                file: frame.location.as_ref().map(|l| l.file.to_string()),
                 line: frame.location.as_ref().map(|l| l.line),
                 variables,
             });
@@ -375,13 +448,7 @@ pub fn build(
     let objects: Vec<ObjectView> = shown
         .into_iter()
         .take(MAX_OBJECTS)
-        .map(|o| ObjectView {
-            id: o.id.0,
-            state: object_state(o),
-            storage: storage_name(o.storage).to_string(),
-            address: o.address.map(|a| format!("0x{a:x}")),
-            slot: slot(state, None, Some(o.ty), &o.value),
-        })
+        .map(|o| object_view(state, o))
         .collect();
 
     GraphView {
@@ -395,5 +462,6 @@ pub fn build(
         globals,
         objects,
         objects_omitted: omitted,
+        focus: Vec::new(),
     }
 }

@@ -9,10 +9,11 @@
 //! Anything ambiguous is skipped rather than guessed: an un-instrumented construct
 //! loses observations; a wrongly instrumented one could change the program.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use super::libclang::{type_kind, Clang, Cursor, CHILD_CONTINUE};
+use super::layout::{self, Layout};
+use super::libclang::{type_kind, Clang, Cursor, Type, CHILD_CONTINUE};
 
 /// A class/struct to describe to the runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,9 +24,12 @@ pub struct RecordSite {
     pub fields: Vec<String>,
     /// Byte offset just after the `;` that ends the definition.
     pub insert_at: usize,
+    /// Per field: a layout (index into `Analysis::layouts`) when the field's type is a
+    /// library class the runtime could not otherwise describe.
+    pub field_layouts: Vec<Option<usize>>,
 }
 
-/// A non-placement, non-array `new` expression of a nameable type.
+/// A non-placement `new` / `new[]` expression of a nameable type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSite {
     pub start: usize,
@@ -35,16 +39,23 @@ pub struct NewSite {
     pub line: u32,
     pub column: u32,
     pub function: String,
-    /// The allocated type as C++ spells it (`Node`, `int`).
+    /// The allocated type as C++ spells it (`Node`, `int`); for `new T[n]` the
+    /// element type `T`.
     pub ty: String,
+    /// `new T[n]`: the allocation is an array of `ty`.
+    pub array: bool,
+    /// `new T[n]` of a scalar with no initializer: the elements are indeterminate.
+    pub uninit: bool,
+    /// Layout of `ty`, when it is a class the runtime could not otherwise describe.
+    pub layout: Option<usize>,
 }
 
-/// A non-array `delete` expression.
+/// A `delete` or `delete[]` expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteSite {
     pub start: usize,
     pub end: usize,
-    /// Offset just after the `delete` keyword.
+    /// Offset just after the `delete` keyword (for `delete[]`, after the `]`).
     pub kw_end: usize,
     pub line: u32,
     pub column: u32,
@@ -92,6 +103,20 @@ pub enum HookKind {
 pub struct VarHook {
     pub name: String,
     pub kind: HookKind,
+    /// Layout of the variable's type (the referent's, for a reference).
+    pub layout: Option<usize>,
+}
+
+/// A point after a statement where the runtime compares the program's tracked memory
+/// with what it last reported, to notice changes made by calls it cannot see into
+/// (library code, constructors, `memcpy`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncSite {
+    /// Offset just after the statement's `;`.
+    pub insert_at: usize,
+    pub line: u32,
+    pub column: u32,
+    pub function: String,
 }
 
 /// A function definition with a body we can instrument.
@@ -172,10 +197,38 @@ pub struct Analysis {
     pub locals: Vec<LocalSite>,
     pub fors: Vec<ForSite>,
     pub range_fors: Vec<RangeForSite>,
+    pub syncs: Vec<SyncSite>,
+    /// Layouts of library types, referred to by index from hooks, `new` sites and records.
+    pub layouts: Vec<Layout>,
+    pub layout_keys: HashMap<String, usize>,
+}
+
+/// A path as a map key: libclang spells the path of an included file with whatever
+/// separators and case it was resolved through, so both sides are normalized.
+pub fn norm_path(p: &str) -> String {
+    p.replace('\\', "/").to_lowercase()
+}
+
+/// What analysis found in a translation unit and in the project's own headers it
+/// includes. Every offset in an `Analysis` is into the file it belongs to.
+#[derive(Debug, Default)]
+pub struct ProjectAnalysis {
+    /// The translation unit's own file (carries the compile errors, if any).
+    pub main: Analysis,
+    /// Project headers the unit includes, by [`norm_path`] key.
+    pub headers: Vec<(String, Analysis)>,
 }
 
 #[derive(Default)]
 struct Ctx {
+    /// [`norm_path`] of the translation unit's own file, and of every project header.
+    project: HashSet<String>,
+    main_key: String,
+    /// The file being walked: `""` is the translation unit's own file, else a header's
+    /// [`norm_path`]. `out` and `block_opens` always belong to this file.
+    cur: String,
+    /// The other files' results, set aside while one file is current.
+    parked: HashMap<String, (Analysis, BTreeMap<usize, BlockSite>)>,
     namespaces: Vec<String>,
     function: String,
     /// Types with a class-specific `operator new`: our placement form would be
@@ -190,27 +243,95 @@ struct Ctx {
     out: Analysis,
 }
 
+/// Analyse one translation unit's own file only (headers are left alone).
 pub fn analyze(clang: &Clang, file: &Path, source: &str, args: &[String]) -> Result<Analysis, String> {
+    Ok(analyze_project(clang, file, source, args, &HashMap::new())?.main)
+}
+
+/// Analyse a translation unit *and* the project's own headers it includes. `headers`
+/// maps [`norm_path`] of each header in the workspace to its text; anything else that
+/// is included (the standard library, third-party headers) is skipped wholesale.
+///
+/// A header's declarations are instrumented in the header itself, so every unit that
+/// includes it sees the same instrumentation; the caller deduplicates headers seen
+/// from several units.
+pub fn analyze_project(
+    clang: &Clang,
+    file: &Path,
+    source: &str,
+    args: &[String],
+    headers: &HashMap<String, String>,
+) -> Result<ProjectAnalysis, String> {
     let tu = clang.parse(file, args)?;
     let mut ctx = Ctx::default();
+    ctx.main_key = norm_path(&file.to_string_lossy());
+    ctx.project = headers.keys().cloned().chain(std::iter::once(ctx.main_key.clone())).collect();
     (ctx.out.errors, ctx.out.ignored_system_errors) = tu.errors();
     if !ctx.out.errors.is_empty() {
-        return Ok(ctx.out);
+        return Ok(ProjectAnalysis { main: ctx.out, headers: Vec::new() });
     }
+    let ignored_system_errors = ctx.out.ignored_system_errors;
     tu.root().visit_children(|c| {
         if c.is_from_main_file() {
+            ctx.enter("");
             walk(c, "TranslationUnit", source, &mut ctx);
+        } else if let Some(name) = c.file_name() {
+            let key = norm_path(&name);
+            if let Some(text) = headers.get(&key) {
+                ctx.enter(&key);
+                walk(c, "TranslationUnit", text, &mut ctx);
+            }
         }
         CHILD_CONTINUE
     });
-    ctx.out.blocks = std::mem::take(&mut ctx.block_opens).into_values().collect();
-    Ok(ctx.out)
+    ctx.park();
+    let mut files = std::mem::take(&mut ctx.parked);
+    let finish = |(mut a, blocks): (Analysis, BTreeMap<usize, BlockSite>)| {
+        a.blocks = blocks.into_values().collect();
+        a
+    };
+    let main = files.remove("").map(finish).unwrap_or_default();
+    let mut headers: Vec<(String, Analysis)> = files.into_iter().map(|(k, v)| (k, finish(v))).collect();
+    headers.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut main = main;
+    main.ignored_system_errors = ignored_system_errors;
+    Ok(ProjectAnalysis { main, headers })
+}
+
+impl Ctx {
+    /// Set the current file's results aside under its key.
+    fn park(&mut self) {
+        let out = std::mem::take(&mut self.out);
+        let blocks = std::mem::take(&mut self.block_opens);
+        self.parked.insert(self.cur.clone(), (out, blocks));
+    }
+
+    /// Make `key` the current file, setting the previous one aside.
+    fn enter(&mut self, key: &str) {
+        if self.cur == key {
+            return;
+        }
+        self.park();
+        self.cur = key.to_string();
+        let (out, blocks) = self.parked.remove(key).unwrap_or_default();
+        self.out = out;
+        self.block_opens = blocks;
+    }
+
+    /// Is this cursor written in the file being walked?
+    fn here(&self, c: Cursor<'_>) -> bool {
+        if self.cur.is_empty() {
+            c.is_from_main_file()
+        } else {
+            c.file_name().is_some_and(|n| norm_path(&n) == self.cur)
+        }
+    }
 }
 
 const FUNCTION_KINDS: [&str; 5] = ["FunctionDecl", "CXXMethod", "CXXConstructor", "CXXDestructor", "CXXConversion"];
 
 fn walk(c: Cursor<'_>, parent: &str, src: &str, ctx: &mut Ctx) {
-    if !c.is_from_main_file() {
+    if !ctx.here(c) {
         return;
     }
     let kind = c.kind_name();
@@ -277,8 +398,62 @@ fn is_scalar_kind(k: i32) -> bool {
 
 // ---- functions, blocks, variables ----------------------------------------------
 
+// ---- layouts of library types -------------------------------------------------------
+
+/// Is `decl` a record the instrumenter describes by itself (so a layout should refer to
+/// it rather than copy it)? A project struct/class at namespace scope with a plain name,
+/// already defined where the layout is used (so its name can be written there).
+fn is_described(decl: &Cursor<'_>, ctx: &Ctx, at: usize) -> bool {
+    if !decl.is_definition() {
+        return false;
+    }
+    let Some(file) = decl.file_name().map(|f| norm_path(&f)) else { return false };
+    if !ctx.project.contains(&file) {
+        return false;
+    }
+    let name = decl.spelling();
+    if name.is_empty() || name.contains(['<', '(', ' ']) {
+        return false;
+    }
+    let parent = decl.semantic_parent().kind_name();
+    if parent != "TranslationUnit" && parent != "Namespace" {
+        return false;
+    }
+    // In the file being walked it must come before the use.
+    let current = if ctx.cur.is_empty() { &ctx.main_key } else { &ctx.cur };
+    if file == *current {
+        return decl.plain_range().is_some_and(|(s, _)| s.offset < at);
+    }
+    true
+}
+
+/// A layout for a value of type `ty`, if it holds a library class (or template
+/// instantiation) nothing else describes. `at` is the offset of the code that will use
+/// it. Returns an index into `ctx.out.layouts`.
+fn layout_for(ctx: &mut Ctx, ty: Type<'_>, name: &str, at: usize) -> Option<usize> {
+    let described = |d: &Cursor<'_>| is_described(d, &*ctx, at);
+    let site = layout::Site { is_described: &described };
+    if !layout::needs_layout(ty, &site) {
+        return None;
+    }
+    let key = format!("{name}|{at}");
+    if let Some(i) = ctx.out.layout_keys.get(&key) {
+        return Some(*i);
+    }
+    let built = layout::build(ty, name, &site)?;
+    ctx.out.layouts.push(built);
+    let i = ctx.out.layouts.len() - 1;
+    ctx.out.layout_keys.insert(key, i);
+    Some(i)
+}
+
+/// A type as the user would write it in a declaration, without top-level qualifiers.
+fn plain_name(spelling: &str) -> String {
+    spelling.trim_start_matches("const ").trim_start_matches("volatile ").trim().to_string()
+}
+
 /// How (or whether) a variable declaration is reported.
-fn hook_for_var(var: Cursor<'_>, src: &str) -> Option<VarHook> {
+fn hook_for_var(var: Cursor<'_>, src: &str, ctx: &mut Ctx) -> Option<VarHook> {
     if var.kind_name() != "VarDecl" {
         return None; // structured bindings, typedefs, local classes...
     }
@@ -295,15 +470,19 @@ fn hook_for_var(var: Cursor<'_>, src: &str) -> Option<VarHook> {
     if matches!(k, 0 | 1 | type_kind::DEPENDENT | type_kind::VARIABLE_ARRAY | type_kind::INCOMPLETE_ARRAY) {
         return None;
     }
+    let at = var.plain_range().map_or(0, |(s, _)| s.offset);
     if k == type_kind::LVALUE_REF || k == type_kind::RVALUE_REF {
-        return Some(VarHook { name, kind: HookKind::Ref });
+        let referent = ty.pointee();
+        let layout = layout_for(ctx, referent, &plain_name(&referent.spelling()), at);
+        return Some(VarHook { name, kind: HookKind::Ref, layout });
     }
+    let layout = layout_for(ctx, var.ty(), &plain_name(&var.ty().spelling()), at);
     // `int x;` / `int a[3];` have storage but no value yet. Class types are
     // constructed, so they are always read.
     let scalar_like = is_scalar_kind(k)
         || (k == type_kind::CONSTANT_ARRAY && is_scalar_kind(ty.array_element().canonical().kind()));
     let uninit = scalar_like && !has_initializer(var, &name, src);
-    Some(VarHook { name, kind: if uninit { HookKind::Uninit } else { HookKind::Value } })
+    Some(VarHook { name, kind: if uninit { HookKind::Uninit } else { HookKind::Value }, layout })
 }
 
 /// Is there anything after the declarator name (other than array bounds)?
@@ -393,7 +572,10 @@ fn function(c: Cursor<'_>, kind: &str, src: &str, ctx: &mut Ctx) {
                         return None;
                     }
                     let is_ref = k == type_kind::LVALUE_REF || k == type_kind::RVALUE_REF;
-                    Some(VarHook { name: n, kind: if is_ref { HookKind::Ref } else { HookKind::Value } })
+                    let at = p.plain_range().map_or(0, |(s, _)| s.offset);
+                    let shown = if is_ref { p.ty().canonical().pointee() } else { p.ty() };
+                    let layout = layout_for(ctx, shown, &plain_name(&shown.spelling()), at);
+                    Some(VarHook { name: n, kind: if is_ref { HookKind::Ref } else { HookKind::Value }, layout })
                 })
                 .collect();
             Some(FunctionSite { name: display.clone(), open: bs.offset + 1, line: fs.line, column: fs.column, params })
@@ -410,16 +592,31 @@ fn function(c: Cursor<'_>, kind: &str, src: &str, ctx: &mut Ctx) {
     ctx.function = saved_fn;
 }
 
-fn local_site(decl: Cursor<'_>, src: &str, ctx: &Ctx) -> Option<LocalSite> {
+fn local_site(decl: Cursor<'_>, src: &str, ctx: &mut Ctx) -> Option<LocalSite> {
     let (s, e) = decl.plain_range()?;
     if !src.get(..e.offset)?.ends_with(';') {
         return None;
     }
-    let vars: Vec<VarHook> = decl.children().into_iter().filter_map(|v| hook_for_var(v, src)).collect();
+    let vars: Vec<VarHook> = decl.children().into_iter().filter_map(|v| hook_for_var(v, src, ctx)).collect();
     if vars.is_empty() {
         return None;
     }
     Some(LocalSite { insert_at: e.offset, line: s.line, column: s.column, function: ctx.function.clone(), vars })
+}
+
+/// Where the `;` of an expression or declaration statement ends (just after it), and where
+/// the statement starts. `None` for anything else, and for macro text.
+fn statement_end(k: Cursor<'_>, src: &str) -> Option<(usize, super::libclang::FilePos)> {
+    let (s, e) = k.plain_range()?;
+    if k.kind_name() == "DeclStmt" {
+        return src.get(..e.offset)?.ends_with(';').then_some((e.offset, s));
+    }
+    if !k.is_expression() {
+        return None;
+    }
+    let rest = src.get(e.offset..)?;
+    let trimmed = rest.trim_start();
+    trimmed.starts_with(';').then(|| (e.offset + (rest.len() - trimmed.len()) + 1, s))
 }
 
 fn block(c: Cursor<'_>, parent: &str, src: &str, ctx: &mut Ctx) {
@@ -433,6 +630,17 @@ fn block(c: Cursor<'_>, parent: &str, src: &str, ctx: &mut Ctx) {
             if let Some(site) = local_site(*k, src, ctx) {
                 ctx.out.locals.push(site);
                 hooked = true;
+            }
+        }
+    }
+    // After each plain statement of the block the runtime compares memory with what it
+    // last reported. Only statements directly in a `{ }` (never the unbraced body of an
+    // `if`/loop, where a second statement would change the meaning), and not in a
+    // statement-expression, whose value is its last statement.
+    if parent != "StmtExpr" {
+        for k in &kids {
+            if let Some((end, s)) = statement_end(*k, src) {
+                ctx.out.syncs.push(SyncSite { insert_at: end, line: s.line, column: s.column, function: ctx.function.clone() });
             }
         }
     }
@@ -472,7 +680,7 @@ fn for_stmt(c: Cursor<'_>, src: &str, ctx: &mut Ctx) {
     if init.kind_name() != "DeclStmt" || !cond.is_expression() || !inc.is_expression() {
         return;
     }
-    let vars: Vec<VarHook> = init.children().into_iter().filter_map(|v| hook_for_var(v, src)).collect();
+    let vars: Vec<VarHook> = init.children().into_iter().filter_map(|v| hook_for_var(v, src, ctx)).collect();
     if vars.is_empty() {
         return;
     }
@@ -498,7 +706,7 @@ fn range_for(c: Cursor<'_>, src: &str, ctx: &mut Ctx) {
     if var.kind_name() != "VarDecl" || body.kind_name() != "CompoundStmt" {
         return;
     }
-    let Some(hook) = hook_for_var(*var, src) else { return };
+    let Some(hook) = hook_for_var(*var, src, ctx) else { return };
     let Some(open) = add_block(*body, src, ctx) else { return };
     let Some((s, _)) = c.plain_range() else { return };
     ctx.out.range_fors.push(RangeForSite {
@@ -516,7 +724,7 @@ fn record(c: Cursor<'_>, src: &str, ctx: &mut Ctx) {
     let name = c.spelling();
     // Custom allocation functions are noted even if the record is not described.
     for m in c.children() {
-        if m.kind_name() == "CXXMethod" && m.spelling() == "operator new" {
+        if m.kind_name() == "CXXMethod" && matches!(m.spelling().as_str(), "operator new" | "operator new[]") {
             ctx.custom_alloc.insert(name.clone());
             ctx.custom_alloc.insert(qualified(ctx, &name));
         }
@@ -539,6 +747,7 @@ fn record(c: Cursor<'_>, src: &str, ctx: &mut Ctx) {
     let insert_at = end.offset + (after.len() - trimmed.len()) + 1;
 
     let mut fields = Vec::new();
+    let mut field_layouts = Vec::new();
     for m in c.children() {
         if m.kind_name() != "FieldDecl" || m.access() != 1 || m.is_bitfield() {
             continue;
@@ -552,9 +761,11 @@ fn record(c: Cursor<'_>, src: &str, ctx: &mut Ctx) {
         {
             continue;
         }
+        let ty = m.ty();
+        field_layouts.push(layout_for(ctx, ty, &plain_name(&ty.spelling()), insert_at));
         fields.push(fname);
     }
-    ctx.out.records.push(RecordSite { name: qualified(ctx, &name), fields, insert_at });
+    ctx.out.records.push(RecordSite { name: qualified(ctx, &name), fields, insert_at, field_layouts });
 }
 
 fn new_expr(c: Cursor<'_>, src: &str, ctx: &mut Ctx) {
@@ -566,10 +777,10 @@ fn new_expr(c: Cursor<'_>, src: &str, ctx: &mut Ctx) {
     if rest.starts_with('(') {
         return;
     }
-    // `new T[n]`: arrays are a later milestone. Ambiguity resolves to "skip".
-    if matches!(rest.find(['(', '{', '[']).map(|i| rest.as_bytes()[i]), Some(b'[')) {
-        return;
-    }
+    // `new T[n]`, `new T[n]()`, `new T[n]{...}`: the first of `( { [` after the type
+    // tells which; a `[` first means an array.
+    let initializer = rest.find(['(', '{', '[']).map(|i| rest.as_bytes()[i]);
+    let array = initializer == Some(b'[');
     let pointee = c.ty().pointee();
     let ty = pointee.spelling();
     if ty.is_empty() || ty.contains(['(', '\'']) || ty.contains("unnamed") || ty.contains("anonymous") {
@@ -579,6 +790,14 @@ fn new_expr(c: Cursor<'_>, src: &str, ctx: &mut Ctx) {
     if ctx.custom_alloc.contains(bare) {
         return;
     }
+    // `new int[n]` leaves its elements indeterminate; with `()`/`{}` after the last
+    // extent they are value-initialized. (Class elements always run a constructor.)
+    let mut element = pointee.canonical();
+    while element.kind() == type_kind::CONSTANT_ARRAY {
+        element = element.array_element().canonical(); // `new int[3][4]`: elements are `int[4]`
+    }
+    let uninit = array && is_scalar_kind(element.kind()) && !has_array_initializer(rest);
+    let layout = layout_for(ctx, pointee, &plain_name(&ty), s.offset);
     ctx.out.news.push(NewSite {
         start: s.offset,
         end: e.offset,
@@ -587,20 +806,62 @@ fn new_expr(c: Cursor<'_>, src: &str, ctx: &mut Ctx) {
         column: s.column,
         function: ctx.function.clone(),
         ty,
+        array,
+        uninit,
+        layout,
     });
+}
+
+/// Is there an initializer after the last `[..]` extent of `new T[a][b]...`?
+/// `rest` is the text after the `new` keyword.
+fn has_array_initializer(rest: &str) -> bool {
+    let Some(first) = rest.find('[') else { return true };
+    let mut tail = &rest[first..];
+    loop {
+        tail = tail.trim_start();
+        if !tail.starts_with('[') {
+            return !tail.is_empty() && tail.starts_with(['(', '{']);
+        }
+        let mut depth = 0;
+        let mut end = None;
+        for (i, ch) in tail.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(i) => tail = &tail[i + 1..],
+            None => return true, // unbalanced: assume initialized (never claim "uninitialized")
+        }
+    }
 }
 
 fn delete_expr(c: Cursor<'_>, src: &str, ctx: &mut Ctx) {
     let Some((s, e)) = c.plain_range() else { return };
     let Some(text) = src.get(s.offset..e.offset) else { return };
     let Some(rest) = text.strip_prefix("delete") else { return };
-    if rest.trim_start().starts_with('[') {
-        return; // delete[]
+    // `delete[] p`: the hint goes after the `]`. Only the plain `[]` form is touched.
+    let mut kw_end = s.offset + 6;
+    let after = rest.trim_start();
+    if let Some(inner) = after.strip_prefix('[') {
+        let Some(close) = inner.trim_start().strip_prefix(']') else { return };
+        kw_end = e.offset - close.len();
+        if src.get(kw_end..e.offset) != Some(close) {
+            return;
+        }
     }
     ctx.out.deletes.push(DeleteSite {
         start: s.offset,
         end: e.offset,
-        kw_end: s.offset + 6,
+        kw_end,
         line: s.line,
         column: s.column,
         function: ctx.function.clone(),

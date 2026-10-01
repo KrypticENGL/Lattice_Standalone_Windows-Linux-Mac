@@ -97,6 +97,29 @@ export interface GraphView {
   objects: ObjectView[];
   /** Objects that qualified but did not fit. */
   objectsOmitted: number;
+  /**
+   * The objects asked for by id (`observationGraph`'s `focus`), whether or not they are
+   * drawn: a freed object nothing points at any more, or a variable's own storage.
+   * The same type as `objects`: an object has one description.
+   */
+  focus: ObjectView[];
+}
+
+/**
+ * One user-facing step of a run (mirrors `observe::TimelineStep`): a run of raw runtime
+ * events presented as one change. `start`/`end` are raw step numbers, the same numbers
+ * `observationGraph` takes, so the state to show for a step is the one at `end`.
+ */
+export interface TimelineStep {
+  kind: "call" | "return" | "scopeEnd" | "statement" | "truncated";
+  start: number;
+  end: number;
+  /** Raw events folded into this step. */
+  events: number;
+  label: string;
+  line: number | null;
+  /** Call depth (0 = main). */
+  depth: number;
 }
 
 export interface ThreadView {
@@ -107,17 +130,35 @@ export interface ThreadView {
 
 export interface FrameView {
   id: number;
+  thread: number;
+  /** Position on its thread's stack; 0 is the outermost frame (`main`). */
+  depth: number;
   function: string;
+  /** Source file this frame last reported being in. */
+  file: string | null;
   line: number | null;
   variables: VariableView[];
 }
 
+export type VariableKind = "parameter" | "local" | "global" | "staticLocal";
+
 export interface VariableView {
   name: string;
+  kind: VariableKind;
   inBlock: boolean;
   /** The variable's storage object: its anchor. */
   object: number;
   slot: SlotView;
+}
+
+/** When an object began and ended, in timeline steps (the numbers the slider shows). */
+export interface LifetimeView {
+  allocatedStep: number;
+  /** The step at which the end first shows; null while it lives. */
+  endedStep: number | null;
+  endReason: "freed" | "scopeExit" | "frameExit" | "programExit" | "other" | null;
+  /** Source line of the declaration/allocation. */
+  originLine: number | null;
 }
 
 export interface ObjectView {
@@ -125,6 +166,7 @@ export interface ObjectView {
   state: "alive" | "allocated" | "destroyed" | "unknown";
   storage: string;
   address: string | null;
+  lifetime: LifetimeView;
   slot: SlotView;
 }
 
@@ -190,8 +232,14 @@ export const isActive = (s: SessionState | undefined): boolean =>
 const SESSION_EVENT = "lattice://session-state";
 
 /** Compile and run; resolves with the final session once it has ended. */
-export function runProgram(project: string, files: SourceFile[], observe = false): Promise<RuntimeSession> {
-  return invoke<RuntimeSession>("run_program", { request: { project, files, observe } });
+export function runProgram(
+  project: string,
+  files: SourceFile[],
+  observe = false,
+  /** The open solution's folder: the built executable is also kept in its `target` folder. */
+  solution: string | null = null,
+): Promise<RuntimeSession> {
+  return invoke<RuntimeSession>("run_program", { request: { project, files, observe, solution } });
 }
 
 export function observationStatus(): Promise<ObservationStatus> {
@@ -203,9 +251,17 @@ export function observationStep(sessionId: string, step: number): Promise<StepVi
   return invoke<StepView>("observation_step", { sessionId, step });
 }
 
-/** The recorded run of `sessionId` after `step` events as data for the visualization. */
-export function observationGraph(sessionId: string, step: number): Promise<GraphView> {
-  return invoke<GraphView>("observation_graph", { sessionId, step });
+/**
+ * The recorded run of `sessionId` after `step` events as data for the visualization.
+ * `focus` names objects being inspected; they come back in `GraphView.focus`.
+ */
+export function observationGraph(sessionId: string, step: number, focus: number[] = []): Promise<GraphView> {
+  return invoke<GraphView>("observation_graph", { sessionId, step, focus });
+}
+
+/** The user-facing steps of `sessionId`'s recording (raw events grouped; the raw data is unchanged). */
+export function observationTimeline(sessionId: string): Promise<TimelineStep[]> {
+  return invoke<TimelineStep[]>("observation_timeline", { sessionId });
 }
 
 export function stopProgram(sessionId: string): Promise<boolean> {

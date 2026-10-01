@@ -51,6 +51,9 @@ pub struct CXType {
 
 type Visitor = extern "C" fn(CXCursor, CXCursor, *mut c_void) -> c_int;
 
+/// `CXFieldVisitor`: returns `CXVisitorResult` (0 break, 1 continue).
+type FieldVisitor = extern "C" fn(CXCursor, *mut c_void) -> c_int;
+
 /// `CXChildVisitResult`
 pub const CHILD_BREAK: c_int = 0;
 pub const CHILD_CONTINUE: c_int = 1;
@@ -70,6 +73,7 @@ pub mod type_kind {
     pub const CONSTANT_ARRAY: i32 = 112;
     pub const VARIABLE_ARRAY: i32 = 115;
     pub const DEPENDENT: i32 = 26;
+    pub const VOID: i32 = 2;
 }
 
 /// A 1-based source position and byte offset in a file.
@@ -121,6 +125,16 @@ struct Api {
     spelling_location:
         unsafe extern "C" fn(CXSourceLocation, *mut *mut c_void, *mut c_uint, *mut c_uint, *mut c_uint),
     is_from_main_file: unsafe extern "C" fn(CXSourceLocation) -> c_int,
+    file_name: unsafe extern "C" fn(*mut c_void) -> CXString,
+    type_declaration: unsafe extern "C" fn(CXType) -> CXCursor,
+    visit_fields: unsafe extern "C" fn(CXType, FieldVisitor, *mut c_void) -> c_uint,
+    visit_bases: unsafe extern "C" fn(CXType, FieldVisitor, *mut c_void) -> c_uint,
+    type_size_of: unsafe extern "C" fn(CXType) -> i64,
+    array_size: unsafe extern "C" fn(CXType) -> i64,
+    field_offset_bits: unsafe extern "C" fn(CXCursor) -> i64,
+    is_virtual_method: unsafe extern "C" fn(CXCursor) -> c_uint,
+    is_virtual_base: unsafe extern "C" fn(CXCursor) -> c_uint,
+    enum_int_type: unsafe extern "C" fn(CXCursor) -> CXType,
     canonical_type: unsafe extern "C" fn(CXType) -> CXType,
     pointee_type: unsafe extern "C" fn(CXType) -> CXType,
     type_spelling: unsafe extern "C" fn(CXType) -> CXString,
@@ -236,6 +250,16 @@ impl Clang {
             expansion_location: bind!(lib, "clang_getExpansionLocation"),
             spelling_location: bind!(lib, "clang_getSpellingLocation"),
             is_from_main_file: bind!(lib, "clang_Location_isFromMainFile"),
+            file_name: bind!(lib, "clang_getFileName"),
+            type_declaration: bind!(lib, "clang_getTypeDeclaration"),
+            visit_fields: bind!(lib, "clang_Type_visitFields"),
+            visit_bases: bind!(lib, "clang_visitCXXBaseClasses"),
+            type_size_of: bind!(lib, "clang_Type_getSizeOf"),
+            array_size: bind!(lib, "clang_getArraySize"),
+            field_offset_bits: bind!(lib, "clang_Cursor_getOffsetOfField"),
+            is_virtual_method: bind!(lib, "clang_CXXMethod_isVirtual"),
+            is_virtual_base: bind!(lib, "clang_isVirtualBase"),
+            enum_int_type: bind!(lib, "clang_getEnumDeclIntegerType"),
             canonical_type: bind!(lib, "clang_getCanonicalType"),
             pointee_type: bind!(lib, "clang_getPointeeType"),
             type_spelling: bind!(lib, "clang_getTypeSpelling"),
@@ -410,6 +434,41 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// The file this cursor is written in (where a macro is *expanded*, if it is one), as
+    /// libclang spells the path. `None` for built-in/invalid locations.
+    pub fn file_name(&self) -> Option<String> {
+        let a = &self.clang.api;
+        unsafe {
+            let loc = (a.cursor_location)(self.raw);
+            let (mut f, mut l, mut c, mut o) = (std::ptr::null_mut(), 0, 0, 0);
+            (a.expansion_location)(loc, &mut f, &mut l, &mut c, &mut o);
+            if f.is_null() {
+                return None;
+            }
+            let name = self.clang.string((a.file_name)(f));
+            (!name.is_empty()).then_some(name)
+        }
+    }
+
+    /// Offset of a data member from the start of its record, in bits; negative when
+    /// libclang cannot say (dependent or incomplete types).
+    pub fn field_offset_bits(&self) -> i64 {
+        unsafe { (self.clang.api.field_offset_bits)(self.raw) }
+    }
+
+    pub fn is_virtual_method(&self) -> bool {
+        unsafe { (self.clang.api.is_virtual_method)(self.raw) != 0 }
+    }
+
+    pub fn is_virtual_base(&self) -> bool {
+        unsafe { (self.clang.api.is_virtual_base)(self.raw) != 0 }
+    }
+
+    /// The integer type an enum is stored as.
+    pub fn enum_int_type(&self) -> Type<'a> {
+        Type { clang: self.clang, raw: unsafe { (self.clang.api.enum_int_type)(self.raw) } }
+    }
+
     /// `CX_SC_*`: 1 none, 2 extern, 3 static, 6 auto, 7 register.
     pub fn storage_class(&self) -> i32 {
         unsafe { (self.clang.api.storage_class)(self.raw) }
@@ -507,6 +566,46 @@ impl<'a> Type<'a> {
 
     pub fn array_element(&self) -> Type<'a> {
         Type { clang: self.clang, raw: unsafe { (self.clang.api.array_element_type)(self.raw) } }
+    }
+
+    /// The declaration of a class/enum type (the instantiation, for a template).
+    pub fn declaration(&self) -> Cursor<'a> {
+        Cursor { clang: self.clang, raw: unsafe { (self.clang.api.type_declaration)(self.raw) } }
+    }
+
+    /// The data members of a record type, in declaration order, including private ones
+    /// and those of implicit template instantiations (which `visit_children` on the
+    /// declaration does not show).
+    pub fn fields(&self) -> Vec<Cursor<'a>> {
+        self.collect(self.clang.api.visit_fields)
+    }
+
+    /// The base-class specifiers of a record type.
+    pub fn bases(&self) -> Vec<Cursor<'a>> {
+        self.collect(self.clang.api.visit_bases)
+    }
+
+    fn collect(&self, visit: unsafe extern "C" fn(CXType, FieldVisitor, *mut c_void) -> c_uint) -> Vec<Cursor<'a>> {
+        extern "C" fn push(c: CXCursor, data: *mut c_void) -> c_int {
+            // `data` is the `Vec` on the stack of `collect`, alive for the call.
+            unsafe { (*(data as *mut Vec<CXCursor>)).push(c) };
+            1
+        }
+        let mut raw: Vec<CXCursor> = Vec::new();
+        unsafe {
+            visit(self.raw, push, &mut raw as *mut Vec<CXCursor> as *mut c_void);
+        }
+        raw.into_iter().map(|c| Cursor { clang: self.clang, raw: c }).collect()
+    }
+
+    /// `sizeof`, in bytes; negative for incomplete or dependent types.
+    pub fn size_of(&self) -> i64 {
+        unsafe { (self.clang.api.type_size_of)(self.raw) }
+    }
+
+    /// Number of elements of a constant array; negative otherwise.
+    pub fn array_size(&self) -> i64 {
+        unsafe { (self.clang.api.array_size)(self.raw) }
     }
 
     pub fn pointee(&self) -> Type<'a> {

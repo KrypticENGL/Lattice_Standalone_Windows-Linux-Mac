@@ -10,7 +10,7 @@ import type { Recording } from "../runtime/useRecording";
  */
 export function ObservationView({ session, recording }: { session: RuntimeSession; recording: Recording }) {
   const summary = session.observation;
-  const { step, total, setStep } = recording;
+  const { step, total, setStep, userStep, userTotal, setUserStep, next, prev, current, detailed, setDetailed, steps } = recording;
   const [view, setView] = useState<StepView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const latest = useRef(0);
@@ -49,31 +49,40 @@ export function ObservationView({ session, recording }: { session: RuntimeSessio
         <button className="btn" onClick={() => setStep(0)} disabled={step === 0} title="Before the program started">
           Start
         </button>
-        <button className="btn" onClick={() => setStep(step - 1)} disabled={step === 0} aria-label="Previous event">
+        <button className="btn" onClick={prev} disabled={step === 0} aria-label="Previous step">
           ◀
         </button>
         <input
           type="range"
           min={0}
-          max={total}
-          value={step}
-          onChange={(e) => setStep(Number(e.target.value))}
+          max={userTotal}
+          value={userStep}
+          onChange={(e) => setUserStep(Number(e.target.value))}
           aria-label="Position in the run"
         />
-        <button className="btn" onClick={() => setStep(step + 1)} disabled={step >= total} aria-label="Next event">
+        <button className="btn" onClick={next} disabled={step >= total} aria-label="Next step">
           ▶
         </button>
         <button className="btn" onClick={() => setStep(total)} disabled={step >= total} title="The last recorded state">
           End
         </button>
         <span className="muted">
-          event {step.toLocaleString()} of {total.toLocaleString()}
+          {detailed ? "event" : "step"} {userStep.toLocaleString()} of {userTotal.toLocaleString()}
+          {!detailed && step > 0 && ` (events ${step.toLocaleString()}/${total.toLocaleString()})`}
         </span>
+        <label className="muted" title="Show every raw runtime event as its own step">
+          <input type="checkbox" checked={detailed} onChange={(e) => setDetailed(e.target.checked)} /> All events
+        </label>
       </div>
       {error && <p className="diag-error">{error}</p>}
       {view && (
         <>
-          <p className="obs-event">{view.event ?? "(before the program ran)"}</p>
+          <p className="obs-event">
+            {current && !detailed ? current.label : (view.event ?? "(before the program ran)")}
+            {current && !detailed && steps && (
+              <span className="muted"> — {current.events} event{current.events === 1 ? "" : "s"}</span>
+            )}
+          </p>
           {view.truncatedHere && (
             <p className="diag-warning">The recording ends here; the program ran on unobserved.</p>
           )}
