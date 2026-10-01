@@ -8,6 +8,26 @@ use serde::Serialize;
 
 use crate::toolchain::{CompilerDiagnostic, CompilerInfo};
 
+/// What observing a run produced, in numbers the UI can show. The recorded state
+/// itself stays in the backend (see `observe`); this is only its summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationSummary {
+    /// Events recorded.
+    pub events: u64,
+    /// The step to open the recording at: the last state in which the program is
+    /// still "inside" `main` (just before the closing function exits), because the
+    /// very last state, with every frame gone, shows nothing.
+    pub final_step: u64,
+    /// The recording stopped at its event budget: the program ran on unobserved.
+    pub truncated: bool,
+    pub event_limit: u64,
+    /// Set when the run was not instrumented (and why).
+    pub skipped: Option<String>,
+    /// Problems with the event stream itself; empty for a healthy run.
+    pub issues: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SessionId(String);
@@ -128,6 +148,8 @@ pub struct RuntimeSession {
     pub error: Option<String>,
     /// Configured run timeout, echoed so the UI can report it.
     pub run_timeout_ms: u64,
+    /// Present when the run was observed (see `observe`).
+    pub observation: Option<ObservationSummary>,
 }
 
 impl RuntimeSession {
@@ -155,6 +177,7 @@ impl RuntimeSession {
             exit_code: None,
             termination_reason: None,
             error: None,
+            observation: None,
             run_timeout_ms,
         }
     }

@@ -6,7 +6,7 @@ import { isActive, onSessionState, runProgram, stopProgram, type RuntimeSession 
  * Owns the "current session" for the UI: starts runs, stops them, and tracks
  * live state changes pushed from the native engine.
  */
-export function useExecution(getSource: () => string, fileName: string) {
+export function useExecution(getSource: () => string, fileName: string, observe: boolean) {
   const [session, setSession] = useState<RuntimeSession | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
@@ -38,7 +38,7 @@ export function useExecution(getSource: () => string, fileName: string) {
     setSession(null);
     currentId.current = null;
     try {
-      const final = await runProgram("Untitled", [{ name: fileName, contents: getSource() }]);
+      const final = await runProgram("Untitled", [{ name: fileName, contents: getSource() }], observe);
       setSession(final);
     } catch (err) {
       setLocalError(String(err));
@@ -46,7 +46,7 @@ export function useExecution(getSource: () => string, fileName: string) {
       currentId.current = null;
       setPending(false);
     }
-  }, [getSource, fileName]);
+  }, [getSource, fileName, observe]);
 
   const stop = useCallback(() => {
     if (session && isActive(session.state)) void stopProgram(session.id);

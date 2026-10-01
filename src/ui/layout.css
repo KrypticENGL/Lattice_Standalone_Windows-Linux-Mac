@@ -100,3 +100,54 @@ button:disabled { cursor: default; opacity: .55; }
 .dialog-field input { height: 30px; padding: 0 8px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; font: 12px var(--font-mono); }
 .dialog details { margin-bottom: 10px; color: var(--muted); }
 .dialog-actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+
+/* Observation: toggle and the step view in the Runtime tab */
+.btn-toggle[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.btn-toggle:disabled { opacity: 0.55; }
+.output-body .diag-warning { color: #e0a458; margin: 0 0 6px; }
+.obs { margin-top: 10px; }
+.obs-controls { display: flex; align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+.obs-controls input[type="range"] { flex: 1 1 160px; min-width: 120px; accent-color: var(--accent); }
+.obs-controls .btn { height: 26px; }
+.obs-event { color: var(--accent); margin: 0 0 6px; white-space: pre-wrap; }
+.obs-text { margin: 0; white-space: pre; overflow-x: auto; font-family: var(--font-mono); }
+
+/* Visualization: the program's runtime state */
+.exec-line { background: rgba(201, 226, 101, 0.16); }
+.exec-line-gutter { background: var(--accent); width: 3px !important; margin-left: 3px; }
+.viz { height: 100%; display: flex; flex-direction: column; min-height: 0; outline: none; }
+.viz-controls { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.viz-controls .btn-icon { width: 28px; height: 26px; }
+.viz-slider { flex: 1 1 140px; min-width: 100px; accent-color: var(--accent); }
+.viz-position { color: var(--muted); font-family: var(--font-mono); font-size: 12px; min-width: 70px; text-align: right; }
+.viz-event { flex: 1 1 100%; color: var(--accent); font-family: var(--font-mono); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.viz-scroll { flex: 1; min-height: 0; overflow: auto; background: var(--bg); }
+.viz-note { padding: 4px 10px; color: var(--muted); font-size: 12px; }
+.viz-warn { color: #e0a458; }
+.viz-error { color: #f07178; }
+.viz-svg { display: block; font-family: var(--font-mono); font-size: 12px; user-select: none; }
+.viz-svg .box { transition: transform 0.28s ease; }
+.viz-svg .box-body { fill: var(--bg-elevated); stroke: var(--border); stroke-width: 1; }
+.viz-svg .box-rule { stroke: var(--border); }
+.viz-svg .box-title { fill: var(--text); font-weight: 600; }
+.viz-svg .box-sub { fill: var(--muted); font-size: 11px; }
+.viz-svg .box-frame .box-body { stroke: #3a4a5c; }
+.viz-svg .box-frame.current .box-body { stroke: var(--accent); }
+.viz-svg .box-globals .box-title { fill: var(--muted); }
+.viz-svg .box-object .box-body { stroke: #2e4a63; }
+.viz-svg .box.changed .box-body { stroke: var(--accent); stroke-width: 2; }
+.viz-svg .state-destroyed { opacity: 0.5; }
+.viz-svg .state-destroyed .box-body { stroke-dasharray: 5 4; stroke: #f07178; }
+.viz-svg .state-allocated .box-body { stroke-dasharray: 2 3; }
+.viz-svg .row .lbl { fill: var(--muted); }
+.viz-svg .row .val { fill: var(--text); }
+.viz-svg .row.muted .val, .viz-svg .row.muted .lbl { fill: #5d6b7a; }
+.viz-svg .row-changed { fill: rgba(201, 226, 101, 0.18); }
+.viz-svg .ptr-dot { fill: var(--accent); }
+.viz-svg .edge { fill: none; stroke: #8fb0d0; stroke-width: 1.4; }
+.viz-svg .edge.reference { stroke-dasharray: 2 3; }
+.viz-svg .edge.changed { stroke: var(--accent); stroke-width: 2.2; }
+.viz-svg .edge.dangling { stroke: #f07178; stroke-dasharray: 5 4; }
+.viz-svg .arrow-head { fill: #8fb0d0; }
+.viz-svg .arrow-head-changed { fill: var(--accent); }
+.viz-svg .arrow-head-dangling { fill: #f07178; }

@@ -4,7 +4,9 @@
 //! - [`app`]       window/application shell and IPC command surface
 //! - [`config`]    application configuration and execution limits
 //! - [`lsp`]       clangd process bridge for editor language features
-//! - [`model`]     shared data model (nothing defined yet)
+//! - [`model`]     universal runtime model: events -> state -> snapshots
+//! - [`viz`]       view model: one URR snapshot as layout-free data for a renderer
+//! - [`observe`]   runtime observation: libclang analysis, source instrumentation, event receiver
 //! - [`process`]   OS process execution with capture, timeout and tree-kill
 //! - [`toolchain`] compiler abstraction and discovery
 //! - [`runtime`]   sessions: workspace, compile, run; future instrumentation seam
@@ -13,9 +15,11 @@ pub mod app;
 pub mod config;
 pub mod lsp;
 pub mod model;
+pub mod observe;
 pub mod process;
 pub mod runtime;
 pub mod toolchain;
+pub mod viz;
 
 use std::sync::Arc;
 
@@ -36,18 +40,29 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             use tauri::Manager;
-            let execution = Arc::new(ExecutionManager::new(ExecutionConfig::default()));
+            let observation = Arc::new(observe::ObservationService::new());
+            let execution = Arc::new(
+                ExecutionManager::new(ExecutionConfig::default()).with_observer(observation.clone()),
+            );
             let sweeper = execution.clone();
             std::thread::spawn(move || {
                 sweeper.sweep_stale_workspaces();
             });
             let lsp = Arc::new(LspManager::new(lsp::default_settings_path()));
-            app.manage(AppState { execution, lsp });
+            app.manage(AppState {
+                execution,
+                lsp,
+                observation,
+                last_observation: std::sync::Mutex::new(None),
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app::commands::app_info,
             app::commands::run_program,
+            app::commands::observation_status,
+            app::commands::observation_step,
+            app::commands::observation_graph,
             app::commands::stop_program,
             app::commands::toolchain_status,
             app::commands::rescan_toolchain,

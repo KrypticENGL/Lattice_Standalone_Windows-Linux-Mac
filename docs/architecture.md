@@ -31,9 +31,12 @@ strategy. Output is a small native `.exe` plus an NSIS installer.
 ## Deliberately undecided
 
 Still not decided: how the user's program is *observed* (instrumentation,
-debugger, interpreter, ...), the runtime-event wire format, the visualization
-data model, and the renderer technology. `model` and `visualization` remain
-placeholders. **Runtime data-structure visualization is NOT implemented yet.**
+debugger, interpreter, ...), the transport for runtime events, the
+visualization data model, and the renderer technology. The UI-independent
+**universal runtime model** (events, state, snapshots, types, values, links) now
+exists in `src-tauri/src/model`; see `docs/runtime-model.md`. It is fed by
+nothing yet. `visualization` remains a placeholder. **Runtime data-structure
+visualization is NOT implemented yet.**
 What exists is a real compile-and-run pipeline (below) with a marked seam where
 observation will attach.
 
@@ -102,6 +105,9 @@ no dependency on OS process APIs.
 | `runtime::workspace` | per-session directories, source validation, stale sweep |
 | `runtime::manager` | `ExecutionManager`: the only orchestrator; UI-independent |
 | `runtime::instrumentation` | `Instrumenter`, `BuildPlan`, `RuntimeEventStream`: the future seam (no-op today) |
+| `model` | universal runtime model (`RuntimeEvent`, `RuntimeState`, `Timeline`, `RuntimeSnapshot`); independent of everything else; see `docs/runtime-model.md` |
+| `viz` | the visualization's view of the runtime: one URR snapshot as layout-free data (frames, variables, objects as slot trees, pointer targets); depends on `model` only; the layout and rendering live in the frontend (`src/visualization`) |
+| `observe` | runtime observation: libclang analysis, insertion-only source instrumentation (heap objects, call frames, scopes, variables), the in-process `lattice-runtime`, a live named-pipe receiver into the URR; plugs into `runtime::instrumentation`; opt-in, off by default; see `docs/runtime-observation-architecture.md` |
 | `config` | `ExecutionConfig`: timeouts, output cap, cleanup policy, runtime root, C++ standard |
 
 ### Compiler flow
@@ -124,12 +130,19 @@ no dependency on OS process APIs.
 `ExecutionManager::run`:
 
 validate sources -> pick compiler -> create workspace -> write sources ->
-`Instrumenter::prepare` (no-op) -> **compile** -> (fail: `CompilationFailed`) ->
+`Instrumenter::prepare` (no-op, or the observing instrumenter when the run asked to be
+observed: `RunRequest.observe`) -> **compile** -> (fail: `CompilationFailed`) ->
 **run** the exe with stdin closed, cwd = `executable/`, compiler dir prepended
 to `PATH` (MinGW runtime DLLs) -> capture -> classify exit -> cleanup -> return
 the final `RuntimeSession`. Every state change is also emitted as the
 `lattice://session-state` event so the UI can show "Compiling..." / "Running...".
 `stop_program` cancels the session's token; the process tree is killed.
+
+**Observed runs.** `run_program` takes an `observe` flag. The backend then also
+holds the run's recording (latest run only) and offers `observation_status` (is
+libclang available, and if not, what to do) and `observation_step(session, step)`
+(the recorded state after N events, as text). See
+`docs/runtime-observation-architecture.md`.
 
 ### Temporary workspace strategy
 
@@ -207,8 +220,11 @@ sources -> Instrumenter::prepare -> compile (+BuildPlan.extra_compile_args)
 ```
 
 `runtime::instrumentation` marks where this plugs in. `PassThrough` leaves the
-program untouched. A future strategy can extend `BuildPlan` (rewrite sources,
-add flags, link a runtime library, set environment) and provide a
-`RuntimeEventStream`, which the manager already opens before the run and closes
-after it. The event schema and the strategy are intentionally undefined; the
-engine makes no assumption that the executable is uninstrumented.
+program untouched (still the default). `observe::ObservingInstrumenter` is the
+first real strategy: it rewrites the workspace's copies of the sources, adds the
+runtime library and an event sink to the `BuildPlan`, and provides a
+`RuntimeEventStream` that the manager closes after the run, at which point the
+program's events become a URR `Timeline`. The event schema is the URR's own
+(`model::RuntimeEvent`). See `docs/runtime-observation-architecture.md` for the
+comparison of approaches, the decision, and the limits of the first milestone.
+The engine still makes no assumption that the executable is uninstrumented.

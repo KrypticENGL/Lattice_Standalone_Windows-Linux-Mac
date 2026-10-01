@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import Editor from "@monaco-editor/react";
 import type { editor } from "monaco-editor";
 import { appConfig } from "../config/appConfig";
@@ -14,6 +15,8 @@ interface Props {
   onCursorChange: (pos: CursorPosition) => void;
   /** Hands the parent a function returning the editor's current text. */
   onReady?: (getValue: () => string) => void;
+  /** Highlight this line (the one an observed run is at); null clears it. */
+  highlightLine?: number | null;
 }
 
 const options: editor.IStandaloneEditorConstructionOptions = {
@@ -30,7 +33,27 @@ const options: editor.IStandaloneEditorConstructionOptions = {
   parameterHints: { enabled: true },
 };
 
-export function CodeEditor({ onCursorChange, onReady }: Props) {
+export function CodeEditor({ onCursorChange, onReady, highlightLine = null }: Props) {
+  const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
+  const marks = useRef<editor.IEditorDecorationsCollection | null>(null);
+
+  useEffect(() => {
+    const ed = editorRef.current;
+    const collection = marks.current;
+    if (!ed || !collection) return;
+    if (highlightLine) {
+      collection.set([
+        {
+          range: { startLineNumber: highlightLine, startColumn: 1, endLineNumber: highlightLine, endColumn: 1 },
+          options: { isWholeLine: true, className: "exec-line", linesDecorationsClassName: "exec-line-gutter" },
+        },
+      ]);
+      ed.revealLineInCenterIfOutsideViewport(highlightLine);
+    } else {
+      collection.set([]);
+    }
+  }, [highlightLine]);
+
   return (
     <Editor
       language="cpp"
@@ -39,6 +62,8 @@ export function CodeEditor({ onCursorChange, onReady }: Props) {
       options={options}
       loading={null}
       onMount={(ed) => {
+        editorRef.current = ed;
+        marks.current = ed.createDecorationsCollection([]);
         const report = () => {
           const p = ed.getPosition();
           if (p) onCursorChange({ line: p.lineNumber, column: p.column });

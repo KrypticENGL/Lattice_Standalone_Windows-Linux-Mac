@@ -48,6 +48,7 @@ fn request(src: &str) -> RunRequest {
     RunRequest {
         project: "test".into(),
         files: vec![SourceFile { name: "main.cpp".into(), contents: src.into() }],
+        observe: false,
     }
 }
 
@@ -207,6 +208,7 @@ fn invalid_source_names_are_rejected_before_touching_disk() {
         RunRequest {
             project: "t".into(),
             files: vec![SourceFile { name: "..\\evil.cpp".into(), contents: HELLO.into() }],
+            observe: false,
         },
         &|_| {},
     );

@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::config;
 use crate::lsp::{self, discovery::ClangdStatus, LspManager, LspSession};
+use crate::observe::{self, Observation, ObservationService, ObservationStatus, StepView};
 use crate::runtime::{ExecutionManager, RunRequest, RuntimeSession, SourceFile};
 use crate::toolchain::ToolchainStatus;
 
@@ -14,6 +15,10 @@ pub const SESSION_EVENT: &str = "lattice://session-state";
 pub struct AppState {
     pub execution: Arc<ExecutionManager>,
     pub lsp: Arc<LspManager>,
+    pub observation: Arc<ObservationService>,
+    /// The most recent observed run (session id, its recording). Only one is kept:
+    /// a recording holds every event and object of its run in memory.
+    pub last_observation: Mutex<Option<(String, Arc<Observation>)>>,
 }
 
 #[derive(Serialize)]
@@ -42,6 +47,9 @@ pub struct SourceFileDto {
 pub struct RunProgramRequest {
     pub project: String,
     pub files: Vec<SourceFileDto>,
+    /// Record the run's runtime state (see `observation_status` for availability).
+    #[serde(default)]
+    pub observe: bool,
 }
 
 /// Compile and run the given sources. Resolves when the session has ended; state
@@ -53,6 +61,8 @@ pub async fn run_program(
     request: RunProgramRequest,
 ) -> Result<RuntimeSession, String> {
     let manager = state.execution.clone();
+    let service = state.observation.clone();
+    let observe = request.observe;
     let request = RunRequest {
         project: request.project,
         files: request
@@ -60,14 +70,73 @@ pub async fn run_program(
             .into_iter()
             .map(|f| SourceFile { name: f.name, contents: f.contents })
             .collect(),
+        observe,
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        manager.run(request, &|s: &RuntimeSession| {
+    let (session, recording) = tauri::async_runtime::spawn_blocking(move || {
+        let mut session = manager.run(request, &|s: &RuntimeSession| {
             let _ = app.emit(SESSION_EVENT, s);
-        })
+        });
+        // The recording of an observed run is ready once the run has ended.
+        let recording = if observe {
+            session.workspace_path.as_deref().and_then(|root| service.take(root)).map(|obs| {
+                session.observation = Some(service.summarize(&obs));
+                Arc::new(obs)
+            })
+        } else {
+            None
+        };
+        (session, recording)
     })
     .await
-    .map_err(|e| format!("execution worker failed: {e}"))
+    .map_err(|e| format!("execution worker failed: {e}"))?;
+    // Replace the previous recording (or clear it: it belongs to an older run).
+    *state.last_observation.lock().unwrap() = recording.map(|r| (session.id.as_str().to_string(), r));
+    Ok(session)
+}
+
+/// Whether runs can be observed on this machine, and if not, why and what to do.
+#[tauri::command]
+pub async fn observation_status(state: State<'_, AppState>) -> Result<ObservationStatus, String> {
+    let service = state.observation.clone();
+    tauri::async_runtime::spawn_blocking(move || service.status()).await.map_err(|e| e.to_string())
+}
+
+/// The recorded run of `session_id` after `step` events, as data for the
+/// visualization: frames, variables, heap objects and their pointers.
+#[tauri::command]
+pub async fn observation_graph(
+    state: State<'_, AppState>,
+    session_id: String,
+    step: u64,
+) -> Result<crate::viz::GraphView, String> {
+    let kept = state.last_observation.lock().unwrap().clone();
+    match kept {
+        Some((id, recording)) if id == session_id => {
+            tauri::async_runtime::spawn_blocking(move || observe::graph_at(&recording, step))
+                .await
+                .map_err(|e| e.to_string())
+        }
+        _ => Err("The recording of that run is no longer available (only the latest observed run is kept).".into()),
+    }
+}
+
+/// The recorded run of `session_id` after `step` events, as text. Fails if that
+/// run was not observed or a newer observed run has replaced it.
+#[tauri::command]
+pub async fn observation_step(
+    state: State<'_, AppState>,
+    session_id: String,
+    step: u64,
+) -> Result<StepView, String> {
+    let kept = state.last_observation.lock().unwrap().clone();
+    match kept {
+        Some((id, recording)) if id == session_id => {
+            tauri::async_runtime::spawn_blocking(move || observe::view_at(&recording, step))
+                .await
+                .map_err(|e| e.to_string())
+        }
+        _ => Err("The recording of that run is no longer available (only the latest observed run is kept).".into()),
+    }
 }
 
 #[tauri::command]

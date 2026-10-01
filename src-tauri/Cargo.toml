@@ -15,7 +15,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
@@ -24,9 +24,21 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+
+# Runtime events are parsed as large JSON streams (hundreds of thousands of lines);
+# unoptimized serde made debug builds and `cargo test` about 8x slower at it.
+[profile.dev.package.serde]
+opt-level = 3
+
+[profile.dev.package.serde_json]
+opt-level = 3
 
 # Release: small, fast, stripped binary.
 [profile.release]

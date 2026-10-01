@@ -5,10 +5,15 @@ interface Props {
   running: boolean;
   onRun: () => void;
   onStop: () => void;
+  /** Record the run's runtime state (shown in the Runtime tab). */
+  observe: boolean;
+  onObserveChange: (on: boolean) => void;
+  /** Why observing is not possible right now, or null if it is. */
+  observeUnavailable: string | null;
 }
 
-/** Header. Run/Stop are live; the project picker and settings are still placeholders. */
-export function Toolbar({ running, onRun, onStop }: Props) {
+/** Header. Run/Stop and Observe are live; the project picker and settings are still placeholders. */
+export function Toolbar({ running, onRun, onStop, observe, onObserveChange, observeUnavailable }: Props) {
   return (
     <header className="toolbar">
       <div className="brand">
@@ -23,6 +28,19 @@ export function Toolbar({ running, onRun, onStop }: Props) {
       </button>
 
       <div className="toolbar-spacer" />
+
+      <button
+        className="btn btn-toggle"
+        aria-pressed={observe && !observeUnavailable}
+        disabled={running || observeUnavailable !== null}
+        onClick={() => onObserveChange(!observe)}
+        title={
+          observeUnavailable ??
+          "Record the program's runtime state while it runs; browse it in the Runtime tab"
+        }
+      >
+        Observe
+      </button>
 
       {running ? (
         <button className="btn btn-run" onClick={onStop} title="Stop the running program">

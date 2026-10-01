@@ -1,11 +1,15 @@
 import { useEffect, useState } from "react";
 import type { CompilerDiagnostic, RuntimeSession } from "../runtime";
+import type { Recording } from "../runtime/useRecording";
+import { ObservationView } from "./ObservationView";
 
 const tabs = ["Output", "Errors", "Runtime"] as const;
 type Tab = (typeof tabs)[number];
 
 interface Props {
   session: RuntimeSession | null;
+  /** The shared position in the observed run (also drives the visualization). */
+  recording: Recording;
   /** UI-side failure (e.g. running in a plain browser). */
   runError: string | null;
 }
@@ -13,7 +17,7 @@ interface Props {
 const seconds = (ms: number) => `${(ms / 1000).toString()} s`;
 
 /** Tabbed panel showing the result of the current session. Arrow keys move between tabs. */
-export function OutputPanel({ session, runError }: Props) {
+export function OutputPanel({ session, recording, runError }: Props) {
   const [active, setActive] = useState<Tab>("Output");
   const state = session?.state;
 
@@ -47,7 +51,7 @@ export function OutputPanel({ session, runError }: Props) {
       <div className="panel-body output-body" role="tabpanel">
         {active === "Output" && <OutputTab session={session} />}
         {active === "Errors" && <ErrorsTab session={session} runError={runError} />}
-        {active === "Runtime" && <RuntimeTab session={session} />}
+        {active === "Runtime" && <RuntimeTab session={session} recording={recording} />}
       </div>
     </section>
   );
@@ -74,6 +78,12 @@ function OutputTab({ session: s }: { session: RuntimeSession | null }) {
         </p>
       )}
       {s.state === "terminated" && <p className="out-note">Execution was stopped.</p>}
+      {s.observation && !s.observation.skipped && (
+        <p className="out-note">
+          Observed: {s.observation.events.toLocaleString()} events recorded
+          {s.observation.truncated ? " (stopped at the limit)" : ""}. See the Runtime tab.
+        </p>
+      )}
       {s.state === "failed" && s.exitCode !== null && (
         <p className="diag-error">Program exited with code {s.exitCode}.</p>
       )}
@@ -108,7 +118,7 @@ function Diagnostic({ d }: { d: CompilerDiagnostic }) {
   );
 }
 
-function RuntimeTab({ session: s }: { session: RuntimeSession | null }) {
+function RuntimeTab({ session: s, recording }: { session: RuntimeSession | null; recording: Recording }) {
   if (!s) return <span className="muted">No session yet.</span>;
   const rows: [string, string][] = [
     ["Session", s.id],
@@ -129,7 +139,11 @@ function RuntimeTab({ session: s }: { session: RuntimeSession | null }) {
           ))}
         </tbody>
       </table>
-      <p className="out-note">Runtime data-structure observation is not implemented yet.</p>
+      {s.observation ? (
+        <ObservationView session={s} recording={recording} />
+      ) : (
+        <p className="out-note">Turn on Observe in the toolbar to record the program's runtime state.</p>
+      )}
     </>
   );
 }

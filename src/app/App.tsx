@@ -6,8 +6,10 @@ import { Sidebar } from "../ui/Sidebar";
 import { StatusBar } from "../ui/StatusBar";
 import { Toolbar } from "../ui/Toolbar";
 import { ViewPlaceholder } from "../ui/ViewPlaceholder";
-import { getAppInfo, type AppInfo } from "../utils/native";
+import { getAppInfo, isNative, type AppInfo } from "../utils/native";
+import { observationStatus, type ObservationStatus } from "../runtime";
 import { useExecution } from "../runtime/useExecution";
+import { useRecording } from "../runtime/useRecording";
 import { statusText } from "../runtime/status";
 import { appConfig } from "../config/appConfig";
 import { useClangd } from "../lsp/useClangd";
@@ -21,13 +23,18 @@ export function App() {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [clangdDialog, setClangdDialog] = useState(false);
   const language = useClangd();
+  const [observeWanted, setObserveWanted] = useObservePreference();
+  const obsStatus = useObservationStatus();
+  const observeUnavailable = obsStatus && !obsStatus.available ? (obsStatus.hint ?? "Observation is not available.") : null;
+  const observe = observeWanted && observeUnavailable === null;
 
   const getValueRef = useRef<() => string>(() => "");
   const getSource = useCallback(() => getValueRef.current(), []);
   const onEditorReady = useCallback((fn: () => string) => {
     getValueRef.current = fn;
   }, []);
-  const exec = useExecution(getSource, appConfig.defaultFileName);
+  const exec = useExecution(getSource, appConfig.defaultFileName, observe);
+  const recording = useRecording(exec.session);
 
   // Ctrl+Enter runs (or does nothing while a run is active).
   useEffect(() => {
@@ -63,17 +70,24 @@ export function App() {
 
   return (
     <div className="app">
-      <Toolbar running={exec.running} onRun={() => void exec.run()} onStop={exec.stop} />
+      <Toolbar
+        running={exec.running}
+        onRun={() => void exec.run()}
+        onStop={exec.stop}
+        observe={observe}
+        onObserveChange={setObserveWanted}
+        observeUnavailable={observeUnavailable}
+      />
       <div className="body">
         <Sidebar active={view} onSelect={setView} />
         <main className="content">
           {/* Kept mounted (hidden) so editor state survives view switches. */}
           <div className="view" hidden={view !== "editor"}>
-            <EditorView onCursorChange={setCursor} onEditorReady={onEditorReady} session={exec.session} runError={exec.localError} language={language} onConfigureClangd={() => setClangdDialog(true)} />
+            <EditorView onCursorChange={setCursor} onEditorReady={onEditorReady} session={exec.session} recording={recording} runError={exec.localError} language={language} onConfigureClangd={() => setClangdDialog(true)} />
           </div>
           {view === "visualizer" && (
             <div className="view workspace-single">
-              <Panel title="Visualization"><VisualizationCanvas /></Panel>
+              <Panel title="Visualization"><VisualizationCanvas recording={recording} /></Panel>
             </div>
           )}
           {other && (
@@ -87,4 +101,39 @@ export function App() {
       {clangdDialog && <ClangdDialog onClose={() => setClangdDialog(false)} />}
     </div>
   );
+}
+
+const OBSERVE_KEY = "lattice.observe";
+
+/** Whether the user wants runs observed; remembered across sessions (best effort). */
+function useObservePreference(): [boolean, (on: boolean) => void] {
+  const [on, setOn] = useState(() => {
+    try {
+      return localStorage.getItem(OBSERVE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const set = useCallback((value: boolean) => {
+    setOn(value);
+    try {
+      localStorage.setItem(OBSERVE_KEY, value ? "1" : "0");
+    } catch {
+      /* not persisted; still works for this session */
+    }
+  }, []);
+  return [on, set];
+}
+
+/** Whether observation is possible; re-checked when the window regains focus (the user may have installed libclang). */
+function useObservationStatus(): ObservationStatus | null {
+  const [status, setStatus] = useState<ObservationStatus | null>(null);
+  useEffect(() => {
+    if (!isNative()) return;
+    const refresh = () => void observationStatus().then(setStatus).catch(() => setStatus(null));
+    refresh();
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, []);
+  return status;
 }

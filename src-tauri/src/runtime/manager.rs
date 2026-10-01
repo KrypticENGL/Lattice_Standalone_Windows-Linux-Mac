@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use tracing::{info, warn};
 
-use super::instrumentation::{Instrumenter, PassThrough};
+use super::instrumentation::{Instrumenter, ObserverProvider, PassThrough};
 use super::session::{RuntimeSession, SessionId, SessionState, TerminationReason};
 use super::workspace::{sweep_stale, SourceFile, Workspace};
 use crate::config::{CleanupPolicy, ExecutionConfig};
@@ -23,6 +23,10 @@ use crate::toolchain::{
 pub struct RunRequest {
     pub project: String,
     pub files: Vec<SourceFile>,
+    /// Observe the run (record its runtime state) if an observer is available.
+    /// A run that asks for it and cannot have it fails with an explanation rather
+    /// than quietly running unobserved.
+    pub observe: bool,
 }
 
 pub type StateObserver<'a> = &'a (dyn Fn(&RuntimeSession) + Sync);
@@ -31,6 +35,7 @@ pub struct ExecutionManager {
     config: ExecutionConfig,
     toolchain: Mutex<Arc<Toolchain>>,
     instrumenter: Arc<dyn Instrumenter>,
+    observer: Option<Arc<dyn ObserverProvider>>,
     active: Mutex<HashMap<SessionId, CancelToken>>,
 }
 
@@ -45,6 +50,7 @@ impl ExecutionManager {
             config,
             toolchain: Mutex::new(toolchain),
             instrumenter: Arc::new(PassThrough),
+            observer: None,
             active: Mutex::new(HashMap::new()),
         }
     }
@@ -52,6 +58,12 @@ impl ExecutionManager {
     /// Replace the instrumentation stage (future runtime observation).
     pub fn with_instrumenter(mut self, instrumenter: Arc<dyn Instrumenter>) -> Self {
         self.instrumenter = instrumenter;
+        self
+    }
+
+    /// Where instrumenters for observed runs (`RunRequest::observe`) come from.
+    pub fn with_observer(mut self, observer: Arc<dyn ObserverProvider>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -181,7 +193,22 @@ impl ExecutionManager {
         session.workspace_path = Some(workspace.root.clone());
 
         // --- instrumentation boundary (currently a no-op) ----------------------
-        let mut plan = match self.instrumenter.prepare(&workspace) {
+        let instrumenter: Arc<dyn Instrumenter> = if request.observe {
+            let provided = match &self.observer {
+                Some(provider) => provider.instrumenter(compiler.info(), &self.config.cxx_standard),
+                None => Err("this build of Lattice has no observer".to_string()),
+            };
+            match provided {
+                Ok(i) => i,
+                Err(e) => {
+                    Self::fail(session, format!("Observation is not available: {e}"), observer);
+                    return Some(workspace);
+                }
+            }
+        } else {
+            self.instrumenter.clone()
+        };
+        let mut plan = match instrumenter.prepare(&workspace) {
             Ok(p) => p,
             Err(e) => {
                 Self::fail(session, format!("instrumentation failed: {e}"), observer);

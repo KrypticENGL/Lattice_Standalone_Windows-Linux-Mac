@@ -10,5 +10,5 @@ pub mod session;
 pub mod workspace;
 
 pub use manager::{ExecutionManager, RunRequest};
-pub use session::{RuntimeSession, SessionId, SessionState, TerminationReason};
+pub use session::{ObservationSummary, RuntimeSession, SessionId, SessionState, TerminationReason};
 pub use workspace::SourceFile;

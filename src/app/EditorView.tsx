@@ -4,6 +4,7 @@ import "../editor/monacoSetup";
 import { VisualizationCanvas } from "../visualization/VisualizationCanvas";
 import { OutputPanel } from "../ui/OutputPanel";
 import type { RuntimeSession } from "../runtime";
+import type { Recording } from "../runtime/useRecording";
 import { Panel } from "../ui/Panel";
 import { Splitter } from "../ui/Splitter";
 import { appConfig } from "../config/appConfig";
@@ -16,13 +17,14 @@ interface Props {
   onCursorChange: (pos: CursorPosition) => void;
   onEditorReady: (getValue: () => string) => void;
   session: RuntimeSession | null;
+  recording: Recording;
   runError: string | null;
   language: ClangdSnapshot;
   onConfigureClangd: () => void;
 }
 
 /** Editor + visualization + output split. */
-export function EditorView({ onCursorChange, onEditorReady, session, runError, language, onConfigureClangd }: Props) {
+export function EditorView({ onCursorChange, onEditorReady, session, recording, runError, language, onConfigureClangd }: Props) {
   const [editorWidth, setEditorWidth] = useState(45); // % of workspace width
   const [outputHeight, setOutputHeight] = useState(220); // px
 
@@ -40,17 +42,21 @@ export function EditorView({ onCursorChange, onEditorReady, session, runError, l
           <div className="editor-stack">
             <LanguageBanner language={language} onConfigure={onConfigureClangd} />
             <div className="editor-fill">
-              <CodeEditor onCursorChange={onCursorChange} onReady={onEditorReady} />
+              <CodeEditor
+                onCursorChange={onCursorChange}
+                onReady={onEditorReady}
+                highlightLine={recording.available && recording.step > 0 ? (recording.graph?.line ?? null) : null}
+              />
             </div>
           </div>
         </Panel>
         <Splitter orientation="vertical" onDrag={dragColumns} />
         <Panel title="Visualization" className="viz-panel">
-          <VisualizationCanvas />
+          <VisualizationCanvas recording={recording} />
         </Panel>
       </div>
       <Splitter orientation="horizontal" onDrag={dragRows} />
-      <OutputPanel session={session} runError={runError} />
+      <OutputPanel session={session} runError={runError} recording={recording} />
     </div>
   );
 }
